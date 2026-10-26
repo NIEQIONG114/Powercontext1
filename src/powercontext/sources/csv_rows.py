@@ -112,8 +112,6 @@ def parse_csv_document(input: CSVDocumentInput, /) -> tuple[CSVRowInput, ...]:
     if not document_id:
         raise ValueError("document_id must be non-empty")
 
-    if primary_key != primary_key.strip():
-        raise ValueError("primary_key must not have leading or trailing whitespace")
     if not primary_key:
         raise ValueError("primary_key must be non-empty")
 
@@ -148,32 +146,35 @@ def parse_csv_document(input: CSVDocumentInput, /) -> tuple[CSVRowInput, ...]:
     rows: list[CSVRowInput] = []
     seen_keys: set[str] = set()
 
-    for record in reader:
-        if not record or all(field == "" for field in record):
-            continue
+    try:
+        for record in reader:
+            if not record or all(field == "" for field in record):
+                continue
 
-        if len(record) != len(header):
-            raise ValueError(
-                f"record width {len(record)} does not match header width {len(header)}"
+            if len(record) != len(header):
+                raise ValueError(
+                    f"record width {len(record)} does not match header width {len(header)}"
+                )
+
+            primary_key_value = record[primary_key_index]
+            if not primary_key_value or not primary_key_value.strip():
+                raise ValueError("primary key value must be non-empty")
+
+            if primary_key_value in seen_keys:
+                raise ValueError(f"duplicate primary key value: {primary_key_value!r}")
+            seen_keys.add(primary_key_value)
+
+            rows.append(
+                CSVRowInput(
+                    document_id=document_id,
+                    primary_key=primary_key,
+                    primary_key_value=primary_key_value,
+                    columns=columns,
+                    values=tuple(record),
+                )
             )
-
-        primary_key_value = record[primary_key_index]
-        if not primary_key_value or not primary_key_value.strip():
-            raise ValueError("primary key value must be non-empty")
-
-        if primary_key_value in seen_keys:
-            raise ValueError(f"duplicate primary key value: {primary_key_value!r}")
-        seen_keys.add(primary_key_value)
-
-        rows.append(
-            CSVRowInput(
-                document_id=document_id,
-                primary_key=primary_key,
-                primary_key_value=primary_key_value,
-                columns=columns,
-                values=tuple(record),
-            )
-        )
+    except csv.Error as error:
+        raise ValueError(f"CSV parsing error: {error}") from error
 
     return tuple(rows)
 
