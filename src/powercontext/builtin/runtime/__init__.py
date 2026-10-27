@@ -98,6 +98,12 @@ from powercontext.builtin.runtime.config import (
     InferenceConfig,
     RuntimeConfig,
 )
+from powercontext.builtin.runtime.context_pack import (
+    ContextPack,
+    ContextPackDelta,
+    ContextPackError,
+    apply_context_pack_delta,
+)
 from powercontext.builtin.runtime.decision_model import (
     DecisionKind,
     DecisionModel,
@@ -172,6 +178,11 @@ from powercontext.builtin.runtime.models import (
     SubmitSourceObservation,
     TopicMemoryFlushResult,
 )
+from powercontext.builtin.runtime.prepared_context import (
+    EvidenceFragment,
+    MemoryEntryAddress,
+    PreparedContextBuild,
+)
 from powercontext.builtin.runtime.protocols import PowerContextProvider, RemoteIngestion
 from powercontext.builtin.runtime.readiness import (
     CachedReadinessProbe,
@@ -212,6 +223,7 @@ from powercontext.builtin.statistics import (
 __all__ = [
     "ActivateHandoff",
     "ApproveArtifactCandidateRequest",
+    "apply_context_pack_delta",
     "ArtifactInventoryStatistics",
     "ArtifactProcessingBinding",
     "ArtifactProcessingSupervisor",
@@ -231,6 +243,9 @@ __all__ = [
     "ConnectorCheckpointState",
     "ContextAssembly",
     "ContextAssemblySection",
+    "ContextPack",
+    "ContextPackDelta",
+    "ContextPackError",
     "CreateDreamRunRequest",
     "DatabaseConfig",
     "DecisionKind",
@@ -310,14 +325,17 @@ __all__ = [
     "MemoryWriteVerdict",
     "ModelUsageDay",
     "ModelUsageOperation",
+    "EvidenceFragment",
     "ModelUsagePurpose",
     "ModelUsagePurposeBreakdown",
     "ModelUsageStatistics",
     "ModelUsageValue",
+    "MemoryEntryAddress",
     "PowerContextProvider",
     "PrepareContextRequest",
     "PrepareHandoff",
     "PreparedContext",
+    "PreparedContextBuild",
     "PreparedHandoff",
     "ProposeExperienceRequest",
     "ProposeSkillRequest",

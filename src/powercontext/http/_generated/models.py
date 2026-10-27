@@ -3958,6 +3958,9 @@ class PrepareContextRequest(BaseModel):
         StrictBool,
         Field(description="Opt into current-Scope native code evidence. No index is built during preparation."),
     ] = False
+    evidence_selection: Annotated[
+        StrictBool, Field(description="Select literal evidence spans from the recalled Memory text using the query.")
+    ] = False
     assembly: ContextAssembly | None = None
 
 

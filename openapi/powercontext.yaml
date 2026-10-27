@@ -8917,6 +8917,10 @@ components:
           type: boolean
           default: false
           description: Opt into current-Scope native code evidence. No index is built during preparation.
+        evidence_selection:
+          type: boolean
+          default: false
+          description: Select literal evidence spans from the recalled Memory text using the query.
         assembly:
           $ref: "#/components/schemas/ContextAssembly"
     ContextAssemblySection:

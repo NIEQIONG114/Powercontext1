@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from itertools import chain
 from typing import TypeVar
@@ -33,6 +33,15 @@ from powercontext.builtin.runtime.prepared_code import (
     CodeEvidenceRef,
     PreparedCodeCandidate,
     assemble_code,
+)
+from powercontext.builtin.runtime.prepared_evidence import (
+    covered_terms,
+    document_stems,
+    query_phrases,
+    query_terms,
+    relevance,
+    sentence_spans,
+    term_weights,
 )
 from powercontext.builtin.runtime.prepared_text import (
     TRUST_POLICY,
@@ -56,6 +65,30 @@ class _PreparedContextEntry:
     citation: dict[str, object]
     content: str
     truncated: bool
+
+
+@dataclass(frozen=True)
+class _EvidenceDocument:
+    """One recalled Memory entry offered to the evidence selector."""
+
+    scope_id: str
+    memory_ref: ArtifactRef
+    entry_id: str
+    entry_version_id: str
+    text: str
+
+
+@dataclass(frozen=True)
+class _EvidenceAnalysis:
+    """The query coverage of one candidate document."""
+
+    document: _EvidenceDocument
+    spans: tuple[tuple[int, int], ...]
+    covered: tuple[tuple[frozenset[str], frozenset[str]], ...]
+    region: EvidenceRegion | None = None
+    terms: int = 0
+    phrases: int = 0
+    score: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -100,12 +133,16 @@ class PreparedContextBuild:
     **not** a field here: ``ScopedContextApplication._prepare`` returns ``build.context`` and
     discards the rest, so such a field would have no production observer. The trace is
     delivered through the Runtime's optional ``RecallEffortSink`` instead.
+
+    ``fragments`` is populated only by query-driven evidence selection. Every fragment is a
+    literal span of the original Memory entry, and it lines up one-to-one with ``origins``.
     """
 
     context: PreparedContext
     origins: tuple[PreparedContextOrigin, ...]
     omissions: PreparedContextOmissions = PreparedContextOmissions()
     code_origins: tuple[CodeEvidenceRef, ...] = ()
+    fragments: tuple[EvidenceFragment, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -115,6 +152,20 @@ class MemoryEntryAddress:
     memory: ArtifactAddress
     entry_id: str
     entry_version_id: str
+
+
+@dataclass(frozen=True)
+class EvidenceFragment:
+    """One literal span of an original Memory entry, with its exact origin.
+
+    ``text`` is always ``entry.text[start:end]`` of the entry version named by
+    ``address``; the fragment never carries rewritten or generated evidence.
+    """
+
+    address: MemoryEntryAddress
+    start: int
+    end: int
+    text: str
 
 
 PreparedContextOrigin = MemoryCitation | ArtifactRef | MemoryEntryAddress | ArtifactAddress
@@ -156,6 +207,15 @@ class PreparedContextBuilder:
     topic_memory_entry_limit = 8
     experience_entry_limit = 2
     max_entry_content_bytes = 2000
+    evidence_candidate_limit = 4
+    evidence_document_limit = 1
+    evidence_phrase_bonus = 1.0
+    evidence_anchor_share = 0.5
+    evidence_document_span = 1
+    evidence_document_mix = 0.5
+    evidence_distinct_weight = 0.5
+    evidence_numeric_boost = 2.0
+    evidence_skip_leading = True
     _text_entry_limit: int | None = None
 
     def empty(self) -> PreparedContext:
@@ -234,6 +294,24 @@ class PreparedContextBuilder:
             raise PreparedContextInvariantError("topic-memory-candidate-limit")
         if sum(len(candidates.hits) for candidates in experience_candidates) > self.experience_candidate_limit:
             raise PreparedContextInvariantError("experience-candidate-limit")
+
+        if request.evidence_selection:
+            content, origins, fragments, omissions = self._select_evidence(
+                request=request,
+                current_scope_id=current_scope_id,
+                memory_candidates=memory_candidates,
+            )
+            if content is None:
+                return PreparedContextBuild(context=self.empty(), origins=(), omissions=omissions)
+            content_bytes = len(content.encode("utf-8"))
+            if content_bytes > request.max_bytes:
+                raise PreparedContextInvariantError("output-budget")
+            return PreparedContextBuild(
+                context=PreparedContext(status="ready", content=content, content_bytes=content_bytes),
+                origins=origins,
+                omissions=omissions,
+                fragments=fragments,
+            )
 
         content, origins, omissions = self._select_entries(
             request=request,
@@ -346,6 +424,397 @@ class PreparedContextBuilder:
         if not entries:
             return None, (), omissions
         return _render(entries), tuple(entry.origin for entry in entries), omissions
+
+    def _select_evidence(
+        self,
+        *,
+        request: PrepareContextRequest,
+        current_scope_id: str | None,
+        memory_candidates: Sequence[PreparedMemoryCandidates],
+    ) -> tuple[
+        str | None,
+        tuple[PreparedContextOrigin, ...],
+        tuple[EvidenceFragment, ...],
+        PreparedContextOmissions,
+    ]:
+        """Select literal evidence spans from the recalled Memory text.
+
+        The query alone drives the selection. Every returned fragment is a verbatim
+        range of the original entry, so a caller can verify ``text[start:end]``
+        against the cited entry version without trusting this builder.
+        """
+
+        documents: list[_EvidenceDocument] = []
+        for candidates in memory_candidates:
+            scope_id = candidates.scope_id or current_scope_id or ""
+            for hit in candidates.hits:
+                if not hit.entry_id.strip() or not hit.entry_version_id.strip() or not hit.text.strip():
+                    continue
+                documents.append(
+                    _EvidenceDocument(
+                        scope_id=scope_id,
+                        memory_ref=hit.memory_ref,
+                        entry_id=hit.entry_id,
+                        entry_version_id=hit.entry_version_id,
+                        text=hit.text,
+                    )
+                )
+        if not documents:
+            return None, (), (), PreparedContextOmissions()
+
+        terms = query_terms(request.query)
+        phrases = query_phrases(request.query)
+        passages = [
+            document.text[start:end]
+            for document in documents
+            for start, end in sentence_spans(document.text)
+        ]
+        weights = term_weights(terms, [document_stems(passage) for passage in passages], phrases)
+        # Numbers and units in a claim rarely repeat by accident, so they are the
+        # strongest available hint about which sentence answers it.
+        for term in terms:
+            if any(character.isdigit() for character in term):
+                weights[term] = weights.get(term, 0.0) * self.evidence_numeric_boost
+        analyses = [
+            self._analyze_document(
+                document,
+                terms,
+                phrases,
+                weights,
+                phrase_bonus=self.evidence_phrase_bonus,
+                document_span=self.evidence_document_span,
+            )
+            for document in documents
+        ]
+
+        # Rank every candidate sentence across all documents. Selecting more than
+        # one sentence keeps a mistaken ranking from losing the evidence outright:
+        # the runner-up sentence still lands inside the delivered budget.
+        candidates: list[tuple[float, int, int]] = []
+        for document_index, analysis in enumerate(analyses):
+            for sentence_index, (present, paired) in enumerate(analysis.covered):
+                if not present and not paired:
+                    continue
+                if sentence_index == 0 and self.evidence_skip_leading:
+                    # The assembled document opens with its title, which names the
+                    # topic rather than the finding the claim asks about.
+                    continue
+                score = relevance(present, paired, weights, phrase_bonus=self.evidence_phrase_bonus)
+                candidates.append((score, document_index, sentence_index))
+        candidates.sort(key=lambda item: (-item[0], item[1], item[2]))
+        if not candidates:
+            return None, (), (), PreparedContextOmissions()
+
+        # Every additional document costs one more citation in the envelope, and a
+        # citation is worth several sentences of evidence. Only the leading
+        # documents earn that cost.
+        leading = [
+            index
+            for index, _ in sorted(
+                ((index, analysis.score) for index, analysis in enumerate(analyses)),
+                key=lambda item: (-item[1], item[0]),
+            )
+            if analyses[index].score > 0
+        ][: self.evidence_document_limit]
+        if not leading:
+            leading = [0]
+        allowed = frozenset(leading)
+
+        chosen: dict[int, list[tuple[int, int]]] = {}
+        anchor_budget = int(request.max_bytes * self.evidence_anchor_share)
+        for budget in (anchor_budget, request.max_bytes):
+            chosen = {}
+            for _score, document_index, sentence_index in candidates:
+                if document_index not in allowed:
+                    continue
+                trial = {index: list(value) for index, value in chosen.items()}
+                analysis = analyses[document_index]
+                start, end = _trim_span(
+                    analysis.document.text, *analysis.spans[sentence_index]
+                )
+                trial[document_index] = _merge_ranges(
+                    trial.get(document_index, []), start, end
+                )
+                if self._evidence_size(analyses, trial) > budget:
+                    continue
+                chosen = trial
+            if chosen:
+                break
+        if not chosen:
+            return None, (), (), PreparedContextOmissions()
+
+        # Anchors locate the evidence. Context then grows them, because a wider
+        # literal range can only add tokens to the intersection with the evidence
+        # and never removes the anchor itself.
+        chosen = self._evidence_extend(analyses, chosen, request.max_bytes, weights)
+        chosen = self._evidence_fill(analyses, chosen, request.max_bytes)
+
+        fragments = self._evidence_fragments(analyses, chosen)
+        if not fragments:
+            return None, (), (), PreparedContextOmissions()
+
+        content = _render_evidence(
+            [
+                (
+                    {
+                        "scope_id": fragment.address.memory.scope_id,
+                        "memory_ref": fragment.address.memory.artifact.model_dump(mode="json"),
+                        "entry_id": fragment.address.entry_id,
+                        "entry_version_id": fragment.address.entry_version_id,
+                    },
+                    fragment.text,
+                    fragment.start,
+                    fragment.end,
+                )
+                for fragment in fragments
+            ]
+        )
+        return content, tuple(fragment.address for fragment in fragments), tuple(fragments), PreparedContextOmissions()
+
+    def _evidence_extend(
+        self,
+        analyses: Sequence[_EvidenceAnalysis],
+        chosen: Mapping[int, list[tuple[int, int]]],
+        max_bytes: int,
+        weights: Mapping[str, float],
+    ) -> dict[int, list[tuple[int, int]]]:
+        """Grow the anchored sentences with the neighbouring context that fits.
+
+        The neighbour carrying the most query material is taken first, so the
+        extra text is spent where the evidence continues rather than on filler.
+        """
+
+        current = {index: list(value) for index, value in chosen.items()}
+        while True:
+            best: tuple[float, int, int, int, dict[int, list[tuple[int, int]]]] | None = None
+            for document_index, ranges in current.items():
+                analysis = analyses[document_index]
+                for neighbour in self._evidence_neighbours(analysis, ranges):
+                    trial = {index: list(value) for index, value in current.items()}
+                    start, end = _trim_span(
+                        analysis.document.text, *analysis.spans[neighbour]
+                    )
+                    trial[document_index] = _merge_ranges(ranges, start, end)
+                    size = self._evidence_size(analyses, trial)
+                    if size > max_bytes:
+                        continue
+                    present, paired = analysis.covered[neighbour]
+                    score = relevance(
+                        present, paired, weights, phrase_bonus=self.evidence_phrase_bonus
+                    )
+                    candidate = (score, -size, document_index, neighbour, trial)
+                    if best is None or candidate[:4] > best[:4]:
+                        best = candidate
+            if best is None:
+                return current
+            current = best[4]
+
+    def _evidence_fill(
+        self,
+        analyses: Sequence[_EvidenceAnalysis],
+        chosen: Mapping[int, list[tuple[int, int]]],
+        max_bytes: int,
+    ) -> dict[int, list[tuple[int, int]]]:
+        """Spend the bytes that whole sentences left over on partial context.
+
+        The range grows to the last whole word that still fits, so the delivered
+        text stays readable and still a literal span of the original entry.
+        """
+
+        current = {index: list(value) for index, value in chosen.items()}
+        while True:
+            best: tuple[int, int, int, dict[int, list[tuple[int, int]]]] | None = None
+            for document_index, ranges in current.items():
+                analysis = analyses[document_index]
+                for position, (start, end) in enumerate(ranges):
+                    for direction in (1, -1):
+                        grown = self._evidence_grown(
+                            analyses, document_index, start, end, direction, max_bytes, current
+                        )
+                        if grown is None:
+                            continue
+                        new_start, new_end, trial = grown
+                        candidate = (document_index, position, direction, trial)
+                        if best is None or candidate[:3] < best[:3]:
+                            best = candidate
+            if best is None:
+                return current
+            current = best[3]
+
+    def _evidence_grown(
+        self,
+        analyses: Sequence[_EvidenceAnalysis],
+        document_index: int,
+        start: int,
+        end: int,
+        direction: int,
+        max_bytes: int,
+        current: Mapping[int, list[tuple[int, int]]],
+    ) -> tuple[int, int, dict[int, list[tuple[int, int]]]] | None:
+        """Return the largest word-aligned growth of one range that still fits."""
+
+        analysis = analyses[document_index]
+        text = analysis.document.text
+        limit = len(text)
+        low, high = 0, limit
+        best: tuple[int, int] | None = None
+        while low <= high:
+            middle = (low + high) // 2
+            if direction > 0:
+                candidate_start, candidate_end = start, min(limit, end + middle)
+            else:
+                candidate_start, candidate_end = max(0, start - middle), end
+            candidate_start, candidate_end = _trim_span(text, candidate_start, candidate_end)
+            if candidate_end <= candidate_start:
+                high = middle - 1
+                continue
+            trial = {index: list(value) for index, value in current.items()}
+            trial[document_index] = _merge_ranges(
+                trial.get(document_index, []), candidate_start, candidate_end
+            )
+            if self._evidence_size(analyses, trial) > max_bytes:
+                high = middle - 1
+                continue
+            best = (candidate_start, candidate_end)
+            low = middle + 1
+        if best is None:
+            return None
+        new_start, new_end = best
+        if (new_start, new_end) == (start, end):
+            return None
+        trial = {index: list(value) for index, value in current.items()}
+        trial[document_index] = _merge_ranges(
+            trial.get(document_index, []), new_start, new_end
+        )
+        return new_start, new_end, trial
+
+    @staticmethod
+    def _evidence_neighbours(
+        analysis: _EvidenceAnalysis,
+        ranges: Sequence[tuple[int, int]],
+    ) -> tuple[int, ...]:
+        """Return the sentence indexes directly adjacent to the selected ranges."""
+
+        covered = set()
+        for start, end in ranges:
+            for index, (sentence_start, sentence_end) in enumerate(analysis.spans):
+                if sentence_start < end and start < sentence_end:
+                    covered.add(index)
+        if not covered:
+            return ()
+        neighbours = []
+        for index in (min(covered) - 1, max(covered) + 1):
+            if 0 <= index < len(analysis.spans) and index not in covered:
+                neighbours.append(index)
+        return tuple(neighbours)
+
+    def _evidence_fragments(
+        self,
+        analyses: Sequence[_EvidenceAnalysis],
+        chosen: Mapping[int, list[tuple[int, int]]],
+    ) -> tuple[EvidenceFragment, ...]:
+        """Turn the selected ranges into literal spans of their documents."""
+
+        fragments: list[EvidenceFragment] = []
+        for document_index, ranges in chosen.items():
+            analysis = analyses[document_index]
+            for start, end in ranges:
+                start, end = _trim_span(analysis.document.text, start, end)
+                if end <= start:
+                    continue
+                fragments.append(
+                    EvidenceFragment(
+                        address=MemoryEntryAddress(
+                            memory=ArtifactAddress(
+                                scope_id=analysis.document.scope_id,
+                                artifact=analysis.document.memory_ref,
+                            ),
+                            entry_id=analysis.document.entry_id,
+                            entry_version_id=analysis.document.entry_version_id,
+                        ),
+                        start=start,
+                        end=end,
+                        text=analysis.document.text[start:end],
+                    )
+                )
+        fragments.sort(key=lambda fragment: (fragment.address.entry_id, fragment.start))
+        return tuple(fragments)
+
+    def _evidence_size(
+        self,
+        analyses: Sequence[_EvidenceAnalysis],
+        chosen: Mapping[int, list[tuple[int, int]]],
+    ) -> int:
+        """Return the rendered byte size of one trial selection."""
+
+        fragments = self._evidence_fragments(analyses, chosen)
+        return len(
+            _render_evidence(
+                [
+                    (
+                        {
+                            "scope_id": fragment.address.memory.scope_id,
+                            "memory_ref": fragment.address.memory.artifact.model_dump(mode="json"),
+                            "entry_id": fragment.address.entry_id,
+                            "entry_version_id": fragment.address.entry_version_id,
+                        },
+                        fragment.text,
+                        fragment.start,
+                        fragment.end,
+                    )
+                    for fragment in fragments
+                ]
+            ).encode("utf-8")
+        )
+
+    def _analyze_document(
+        self,
+        document: _EvidenceDocument,
+        terms: Sequence[str],
+        phrases: Sequence[str],
+        weights: Mapping[str, float],
+        *,
+        phrase_bonus: float,
+        document_span: int,
+    ) -> _EvidenceAnalysis:
+        spans = sentence_spans(document.text)
+        covered = [covered_terms(document.text[start:end], terms, phrases) for start, end in spans]
+        scores = [
+            relevance(present, paired, weights, phrase_bonus=phrase_bonus) for present, paired in covered
+        ]
+        best_terms = 0
+        best_phrases = 0
+        distinct: set[str] = set()
+        for present, paired in covered:
+            if len(present) > best_terms:
+                best_terms = len(present)
+            best_phrases = max(best_phrases, len(paired))
+            distinct |= present
+        # The document title names the topic, the body carries the finding, and the
+        # claim's rare words tell the two apart. Together they decide which
+        # document the evidence belongs to.
+        title_score = scores[0] if scores else 0.0
+        body_scores = sorted(scores[1:], reverse=True)
+        body_score = body_scores[0] if body_scores else 0.0
+        distinct_score = sum(weights.get(term, 0.0) for term in distinct)
+        leading = title_score + body_score + self.evidence_distinct_weight * distinct_score
+        return _EvidenceAnalysis(
+            document=document,
+            spans=spans,
+            covered=covered,
+            terms=best_terms,
+            phrases=best_phrases,
+            score=leading,
+        )
+
+    @staticmethod
+    def _evidence_citation(document: _EvidenceDocument) -> dict[str, object]:
+        return {
+            "scope_id": document.scope_id,
+            "memory_ref": document.memory_ref.model_dump(mode="json"),
+            "entry_id": document.entry_id,
+            "entry_version_id": document.entry_version_id,
+        }
 
     def _select_text(
         self,
@@ -692,6 +1161,53 @@ def _render(entries: Sequence[_PreparedContextEntry]) -> str:
     }
     encoded = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
     return "\n\n".join((TRUST_POLICY, f"{_BEGIN_MARKER}\n{encoded}\n{_END_MARKER}"))
+
+
+def _render_evidence(items: Sequence[tuple[dict[str, object], str, int, int]]) -> str:
+    """Render the evidence envelope, keeping the established trust and markers."""
+
+    envelope = {
+        "trust": "untrusted_history",
+        "items": [
+            {"citation": citation, "content": content, "start": start, "end": end}
+            for citation, content, start, end in items
+        ],
+    }
+    encoded = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
+    return "\n\n".join((TRUST_POLICY, f"{_BEGIN_MARKER}\n{encoded}\n{_END_MARKER}"))
+
+
+def _escaped_length(text: str) -> int:
+    """Return the byte length a string occupies inside the rendered JSON envelope."""
+
+    return len(json.dumps(text, ensure_ascii=False).encode("utf-8")) - 2
+
+
+def _trim_span(text: str, start: int, end: int) -> tuple[int, int]:
+    """Trim the surrounding whitespace of one character range."""
+
+    while start < end and text[start].isspace():
+        start += 1
+    while end > start and text[end - 1].isspace():
+        end -= 1
+    return start, end
+
+
+def _merge_ranges(
+    ranges: Sequence[tuple[int, int]],
+    start: int,
+    end: int,
+) -> list[tuple[int, int]]:
+    """Add one character range and merge whatever it touches."""
+
+    merged = sorted([*ranges, (start, end)])
+    result: list[tuple[int, int]] = []
+    for current_start, current_end in merged:
+        if result and current_start <= result[-1][1]:
+            result[-1] = (result[-1][0], max(result[-1][1], current_end))
+        else:
+            result.append((current_start, current_end))
+    return result
 
 
 def _text_item(entry: _PreparedContextEntry) -> ContextTextItem:

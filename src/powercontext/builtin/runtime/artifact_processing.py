@@ -47,6 +47,7 @@ else:
     from multiprocessing.popen_spawn_posix import Popen as SpawnPopen
 
 from powercontext._logging import log_safely
+from powercontext.builtin.persistence.cursors import SourceCursorRepository
 from powercontext.builtin.persistence.database import AsyncDatabase
 from powercontext.builtin.persistence.errors import ArtifactProcessingLeadershipLostError
 from powercontext.builtin.persistence.processing_intents import ArtifactProcessingIntentRepository
@@ -57,7 +58,11 @@ from powercontext.builtin.persistence.supervision import (
     ArtifactProcessingLeaseRepository,
     database_utc_now,
 )
-from powercontext.builtin.persistence.tables import ARTIFACT_PROCESSING_INTENTS_TABLE, ARTIFACT_PROCESSING_LEASES_TABLE
+from powercontext.builtin.persistence.tables import (
+    ARTIFACT_PROCESSING_INTENTS_TABLE,
+    ARTIFACT_PROCESSING_LEASES_TABLE,
+    SOURCE_JOURNAL_HEADS_TABLE,
+)
 from powercontext.builtin.runtime.processing_contracts import (
     ArtifactProcessingWorkAssignment,
     ArtifactProcessingWorkerCompletion,
@@ -114,6 +119,7 @@ class ArtifactProcessingBinding:
     timezone: str = "Asia/Shanghai"
     config_prefix: str | None = None
     pending_provider: ArtifactProcessingPendingProvider | None = None
+    source_count_threshold: int | None = None
     # Only automatic admission is filtered; already accepted requests retain
     # their own Worker authorization and domain completion semantics.
     automatic_scope_filter: Callable[[AsyncConnection, tuple[str, ...]], Awaitable[frozenset[str]]] | None = None
@@ -395,6 +401,7 @@ class _FamilyState:
     scan_after: int = 0
     scan_generation: int = 0
     scan_in_progress: bool = False
+    count_triggered: bool = False
     reconcile_after: str | None = None
     reconcile_complete: bool = False
     notification_at_start: int = 0
@@ -657,6 +664,45 @@ class ArtifactProcessingSupervisor:
             await self._discover_requested(state)
             await self._discover_automatic(state)
 
+    async def _check_count_threshold(
+        self, connection: AsyncConnection, binding: ArtifactProcessingBinding
+    ) -> bool:
+        """Report whether any Scope holds enough unprocessed Sources to trigger."""
+        if binding.source_count_threshold is None:
+            return False
+        counts = await self._scope_source_counts(connection, binding)
+        return any(count >= binding.source_count_threshold for count in counts.values())
+
+    async def _filter_by_count_threshold(
+        self, connection: AsyncConnection, binding: ArtifactProcessingBinding, scope_ids: frozenset[str]
+    ) -> frozenset[str]:
+        """Keep only the Scopes that reached the count threshold."""
+        if binding.source_count_threshold is None:
+            return scope_ids
+        counts = await self._scope_source_counts(connection, binding)
+        return frozenset(
+            scope_id
+            for scope_id in scope_ids
+            if counts.get(scope_id, 0) >= binding.source_count_threshold
+        )
+
+    async def _scope_source_counts(
+        self, connection: AsyncConnection, binding: ArtifactProcessingBinding
+    ) -> dict[str, int]:
+        """Count the Sources each Scope holds beyond its processed cursor."""
+
+        rows = await connection.execute(
+            select(SOURCE_JOURNAL_HEADS_TABLE.c.scope_id, SOURCE_JOURNAL_HEADS_TABLE.c.position)
+        )
+        counts: dict[str, int] = {}
+        for scope_id, position in rows:
+            cursor = await SourceCursorRepository().load(
+                connection, scope_id, binding.binding_name, for_update=False
+            )
+            processed = 0 if cursor is None else cursor.cursor.sequence
+            counts[str(scope_id)] = int(position) - processed
+        return counts
+
     async def _discover_requested(self, state: _FamilyState) -> None:
         capacity = self._fresh_capacity(state)
         if capacity <= 0:
@@ -715,7 +761,10 @@ class ArtifactProcessingSupervisor:
         async with self._database.transaction() as connection:
             await self._leases.require_fence(connection, self._require_current_fence())
             persisted = await self._binding_states.load(connection, binding.binding_name, for_update=True)
-            enabled = binding.automatic_processing_interval is not None or binding.cron is not None
+            # Check if time-based or count-based triggering is enabled
+            time_enabled = binding.automatic_processing_interval is not None or binding.cron is not None
+            count_enabled = binding.source_count_threshold is not None
+            enabled = time_enabled or count_enabled
             if not enabled:
                 if persisted is not None and persisted.scan_in_progress:
                     await self._binding_states.finish_scan(connection, binding.binding_name)
@@ -725,11 +774,30 @@ class ArtifactProcessingSupervisor:
                 now = await database_utc_now(connection)
                 if persisted is None or not persisted.scan_in_progress:
                     checkpoint = None if persisted is None else persisted.last_schedule_checkpoint_at
-                    due, next_time = _schedule_deadline(binding, checkpoint, now)
+                    # Check time-based schedule
+                    time_due = None
+                    next_time = now
+                    if time_enabled:
+                        time_due, next_time = _schedule_deadline(binding, checkpoint, now)
+
+                    # Check count-based schedule (can check even if persisted is None)
+                    count_due = False
+                    if count_enabled:
+                        count_due = await self._check_count_threshold(connection, binding)
+
+                    # Admit if either condition is met
+                    due = time_due is not None or count_due
                     next_schedule_at = asyncio.get_running_loop().time() + max(0, (next_time - now).total_seconds())
-                    if due is not None:
-                        persisted = await self._binding_states.start_scan(connection, binding.binding_name, due)
+                    if due:
+                        # Use now as the due time for count-based triggering
+                        due_time = time_due if time_due is not None else now
+                        persisted = await self._binding_states.start_scan(connection, binding.binding_name, due_time)
                         scan_after = 0
+                        # Only a count-triggered scan holds a Scope back until it
+                        # reaches the threshold. A due schedule processes every
+                        # dirty Scope, exactly as it did before the threshold
+                        # existed.
+                        state.count_triggered = time_due is None and count_due
                 if persisted is not None and persisted.scan_in_progress:
                     scan_in_progress = True
                     if scan_generation != persisted.scan_generation:
@@ -754,6 +822,10 @@ class ArtifactProcessingSupervisor:
                     eligible = frozenset(candidates)
                     if candidates and binding.automatic_scope_filter is not None:
                         eligible &= await binding.automatic_scope_filter(connection, candidates)
+                    # A count-triggered scan admits only the Scopes that reached
+                    # the threshold; a schedule-driven scan admits every dirty Scope.
+                    if eligible and binding.source_count_threshold is not None and state.count_triggered:
+                        eligible = await self._filter_by_count_threshold(connection, binding, eligible)
                     for row in rows:
                         # A full page of ineligible rows still advances discovery;
                         # keep their dirty Source and request counters untouched.
@@ -768,6 +840,7 @@ class ArtifactProcessingSupervisor:
                     if not scan_in_progress:
                         await self._binding_states.finish_scan(connection, binding.binding_name)
                         scan_after = 0
+                        state.count_triggered = False
                         # Starting a scan established its checkpoint, so a
                         # completed page must not restart the interval here.
                         _, next_time = _schedule_deadline(binding, persisted.last_schedule_checkpoint_at, now)
