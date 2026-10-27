@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 
 from sqlalchemy import Table
 from sqlalchemy.ext.asyncio import AsyncConnection
@@ -118,6 +118,19 @@ class MemoryIndex(Protocol):
     ) -> tuple[MemoryProjection, ...]: ...
 
 
+@runtime_checkable
+class MemoryHybridIndex(Protocol):
+    """Optional backend that returns both retrieval channels in one statement."""
+
+    async def search(
+        self,
+        connection: AsyncConnection,
+        scope_id: str,
+        request: MemorySearchRequest,
+        /,
+    ) -> MemorySearchChannels: ...
+
+
 class NoMemoryIndex:
     """Truthfully expose an authoritative store without search projections."""
 
@@ -189,8 +202,9 @@ class NoMemoryIndex:
 class CompositeMemoryIndex:
     """Combine independent search indexes without leaking them into repositories."""
 
-    def __init__(self, *indexes: MemoryIndex) -> None:
+    def __init__(self, *indexes: MemoryIndex, hybrid: MemoryHybridIndex | None = None) -> None:
         self.indexes = indexes
+        self._hybrid = hybrid
         fts = any(index.capabilities.fts for index in indexes)
         vector_indexes = tuple(index for index in indexes if index.capabilities.vector)
         profile = vector_indexes[0].capabilities.embedding_profile if vector_indexes else None
@@ -247,6 +261,8 @@ class CompositeMemoryIndex:
         request: MemorySearchRequest,
         /,
     ) -> MemorySearchChannels:
+        if request.mode == "hybrid" and self._hybrid is not None:
+            return await self._hybrid.search(connection, scope_id, request)
         fts: tuple[MemoryChannelHit, ...] = ()
         vector: tuple[MemoryChannelHit, ...] = ()
         for index in self.indexes:
