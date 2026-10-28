@@ -84,6 +84,7 @@ _DISCOVERY_PAGE_SIZE = 100
 _RETRY_STATE_LIMIT = 1000
 _CHANNEL_QUEUE_LIMIT = _DISCOVERY_PAGE_SIZE // 2
 _DISCOVERY_PAGE_DELAY_SECONDS = 0.01
+_COUNT_TRIGGER_POLL_SECONDS = 0.25
 _DISCOVERY_TIMEOUT_SECONDS = 2.0
 _SPAWN_SIGTERM_GRACE_SECONDS = 1.0
 _WORKER_SHUTDOWN_TIMEOUT_SECONDS = 5.0
@@ -664,9 +665,7 @@ class ArtifactProcessingSupervisor:
             await self._discover_requested(state)
             await self._discover_automatic(state)
 
-    async def _check_count_threshold(
-        self, connection: AsyncConnection, binding: ArtifactProcessingBinding
-    ) -> bool:
+    async def _check_count_threshold(self, connection: AsyncConnection, binding: ArtifactProcessingBinding) -> bool:
         """Report whether any Scope holds enough unprocessed Sources to trigger."""
         if binding.source_count_threshold is None:
             return False
@@ -681,9 +680,7 @@ class ArtifactProcessingSupervisor:
             return scope_ids
         counts = await self._scope_source_counts(connection, binding)
         return frozenset(
-            scope_id
-            for scope_id in scope_ids
-            if counts.get(scope_id, 0) >= binding.source_count_threshold
+            scope_id for scope_id in scope_ids if counts.get(scope_id, 0) >= binding.source_count_threshold
         )
 
     async def _scope_source_counts(
@@ -697,9 +694,7 @@ class ArtifactProcessingSupervisor:
         positions = {str(scope_id): int(position) for scope_id, position in rows}
         if not positions:
             return {}
-        cursors = await SourceCursorRepository().load_many(
-            connection, tuple(positions), binding.binding_name
-        )
+        cursors = await SourceCursorRepository().load_many(connection, tuple(positions), binding.binding_name)
         return {
             scope_id: position - cursors[scope_id].cursor.sequence if scope_id in cursors else position
             for scope_id, position in positions.items()
@@ -776,11 +771,9 @@ class ArtifactProcessingSupervisor:
                 now = await database_utc_now(connection)
                 if persisted is None or not persisted.scan_in_progress:
                     checkpoint = None if persisted is None else persisted.last_schedule_checkpoint_at
-                    # Check time-based schedule
-                    time_due = None
-                    next_time = now
-                    if time_enabled:
-                        time_due, next_time = _schedule_deadline(binding, checkpoint, now)
+                    # Check time-based schedule. A count trigger owns no
+                    # schedule, so it polls for new entries at a bounded rate.
+                    time_due, next_time = _next_deadline(binding, checkpoint, now)
 
                     # Check count-based schedule (can check even if persisted is None)
                     count_due = False
@@ -845,7 +838,7 @@ class ArtifactProcessingSupervisor:
                         state.count_triggered = False
                         # Starting a scan established its checkpoint, so a
                         # completed page must not restart the interval here.
-                        _, next_time = _schedule_deadline(binding, persisted.last_schedule_checkpoint_at, now)
+                        _, next_time = _next_deadline(binding, persisted.last_schedule_checkpoint_at, now)
                         next_schedule_at = asyncio.get_running_loop().time() + max(0, (next_time - now).total_seconds())
                     else:
                         next_discovery_at = asyncio.get_running_loop().time() + _DISCOVERY_PAGE_DELAY_SECONDS
@@ -1207,6 +1200,20 @@ class ArtifactProcessingSupervisor:
                 else type(error).__name__,
             },
         )
+
+
+def _next_deadline(
+    binding: ArtifactProcessingBinding, checkpoint: datetime | None, now: datetime
+) -> tuple[datetime | None, datetime]:
+    """Return the due instant and the next deadline of one binding.
+
+    A binding that only counts new entries has no schedule of its own, so it
+    polls at a bounded rate instead of waking on every pass.
+    """
+
+    if binding.automatic_processing_interval is not None or binding.cron is not None:
+        return _schedule_deadline(binding, checkpoint, now)
+    return None, now + timedelta(seconds=_COUNT_TRIGGER_POLL_SECONDS)
 
 
 def _schedule_deadline(
