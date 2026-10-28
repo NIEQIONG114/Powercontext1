@@ -1180,6 +1180,37 @@ RECURRENCE_OBSERVATION_TABLE = Table(
 
 RECURRENCE_TABLES = (RECURRENCE_MATCH_TABLE, RECURRENCE_OBSERVATION_TABLE)
 
+SOURCE_LIFECYCLE_NODES_TABLE = Table(
+    "pc_source_lifecycle_nodes",
+    SHARED_METADATA,
+    Column("scope_id", identity_string(MAX_SCOPE_ID_LENGTH), primary_key=True),
+    Column("node_id", identity_string(MAX_SOURCE_ID_LENGTH), primary_key=True),
+    Column("node_type", identity_string(16), nullable=False),
+    Column("parents", _entry_text_type(), nullable=False),
+    Column("policy", identity_string(8), nullable=False),
+    Column("revision", Integer, nullable=False),
+    Column("sequence", Integer, nullable=False),
+    Column("event_available", Boolean),
+    Column("withdrawn", Boolean, nullable=False),
+    Column("reference", _entry_text_type(), nullable=False),
+    ForeignKeyConstraint(("scope_id",), ("pc_scopes.scope_id",), ondelete="CASCADE"),
+    CheckConstraint("node_type IN ('source', 'memory', 'topic')", name="ck_pc_source_lifecycle_node_type"),
+    CheckConstraint("policy IN ('all', 'any')", name="ck_pc_source_lifecycle_policy"),
+    CheckConstraint("revision > 0", name="ck_pc_source_lifecycle_revision_positive"),
+    CheckConstraint("sequence >= 0", name="ck_pc_source_lifecycle_sequence_nonnegative"),
+    Index("ix_pc_source_lifecycle_scope", "scope_id"),
+)
+
+SOURCE_LIFECYCLE_SUSPENSIONS_TABLE = Table(
+    "pc_source_lifecycle_suspensions",
+    SHARED_METADATA,
+    Column("scope_id", identity_string(MAX_SCOPE_ID_LENGTH), primary_key=True),
+    Column("artifact_id", identity_string(MAX_ARTIFACT_ID_LENGTH), primary_key=True),
+    Column("revision", Integer, primary_key=True),
+    ForeignKeyConstraint(("scope_id",), ("pc_scopes.scope_id",), ondelete="CASCADE"),
+    CheckConstraint("revision > 0", name="ck_pc_source_lifecycle_suspension_revision_positive"),
+)
+
 BUILTIN_TABLES = (
     SCOPE_TABLES
     + SHARED_TABLES
@@ -1188,4 +1219,5 @@ BUILTIN_TABLES = (
     + STATISTICS_TABLES
     + RECURRENCE_TABLES
     + (ARTIFACT_TAGS_TABLE, DREAM_RUNS_TABLE, RECEIPT_MIGRATION_REVIEW_TABLE)
+    + (SOURCE_LIFECYCLE_NODES_TABLE, SOURCE_LIFECYCLE_SUSPENSIONS_TABLE)
 )

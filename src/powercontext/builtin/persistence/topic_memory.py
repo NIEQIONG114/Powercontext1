@@ -54,6 +54,7 @@ from powercontext.builtin.persistence.supervision import database_utc_now
 from powercontext.builtin.persistence.tables import (
     ARTIFACT_HEADS_TABLE,
     ARTIFACTS_TABLE,
+    SOURCE_LIFECYCLE_SUSPENSIONS_TABLE,
     TOPIC_MEMORY_ACTIVE_CHUNKS_TABLE,
     TOPIC_MEMORY_ACTIVE_TOPICS_TABLE,
     TOPIC_MEMORY_RETRIEVAL_SHAPE_TABLE,
@@ -488,6 +489,22 @@ class TopicMemoryRepository:
         )
         channels = await self.index.search(connection, scope_id, request)
         await self._check_retrieval_shape(connection)
+        suspended = await self._suspended_topic_ids(connection, scope_id)
+        if suspended:
+            channels = channels.model_copy(
+                update={
+                    "topic_fts": tuple(hit for hit in channels.topic_fts if hit.artifact_ref.artifact_id not in suspended),
+                    "topic_vector": tuple(
+                        hit for hit in channels.topic_vector if hit.artifact_ref.artifact_id not in suspended
+                    ),
+                    "detail_fts": tuple(
+                        hit for hit in channels.detail_fts if hit.artifact_ref.artifact_id not in suspended
+                    ),
+                    "detail_vector": tuple(
+                        hit for hit in channels.detail_vector if hit.artifact_ref.artifact_id not in suspended
+                    ),
+                }
+            )
         outcome = _fuse_topic_memory_rankings(query, channels, limit, mode=used_mode, admission=admission)
         return TopicMemorySearchResult(
             mode=used_mode,
@@ -500,6 +517,16 @@ class TopicMemoryRepository:
                 rejected=outcome.rejected,
             ),
         )
+
+    async def _suspended_topic_ids(self, connection: AsyncConnection, scope_id: str, /) -> frozenset[str]:
+        """Return the Topic artifacts whose Source support was withdrawn."""
+
+        rows = await connection.execute(
+            select(SOURCE_LIFECYCLE_SUSPENSIONS_TABLE.c.artifact_id).where(
+                SOURCE_LIFECYCLE_SUSPENSIONS_TABLE.c.scope_id == scope_id,
+            )
+        )
+        return frozenset(str(row[0]) for row in rows)
 
     async def _activate(
         self,
