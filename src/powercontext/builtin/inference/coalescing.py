@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import OrderedDict
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -26,23 +27,25 @@ from powercontext.builtin.inference.protocols import EmbeddingModel
 
 
 @dataclass(slots=True)
-class _BatchExecution:
-    """One underlying batch request with its result future."""
+class _Slot:
+    """One text whose vector is pending, in flight or already resolved.
 
-    texts: tuple[str, ...]
-    future: asyncio.Future[dict[str, tuple[float, ...]]]
-    usage: InferenceUsage = field(default_factory=lambda: InferenceUsage(requests=0))
+    The slot outlives a single caller, so concurrent and late callers share
+    the same underlying request instead of starting a second one.
+    """
+
+    text: str
+    future: asyncio.Future[tuple[float, ...]]
+    batch: _Batch | None = None
 
 
 @dataclass(slots=True)
-class _CallContext:
-    """Tracks one embed() call's registration and results."""
+class _Batch:
+    """One underlying model request and the slots that depend on it."""
 
-    task: asyncio.Task[Any]
-    texts: list[str]
-    batches: list[_BatchExecution] = field(default_factory=list)
-    text_to_batch: dict[str, _BatchExecution] = field(default_factory=dict)
-    event: asyncio.Event = field(default_factory=asyncio.Event)
+    texts: tuple[str, ...]
+    slots: tuple[_Slot, ...]
+    usage: InferenceUsage = field(default_factory=lambda: InferenceUsage(requests=0))
 
 
 class CoalescingEmbeddingModel:
@@ -57,20 +60,21 @@ class CoalescingEmbeddingModel:
         cache_size: int = 1024,
     ) -> None:
         if max_batch_size < 1:
-            raise ValueError("max_batch_size must be positive")
+            raise ValueError("max_batch_size must be positive")  # noqa: TRY003
         if coalesce_ms < 0:
-            raise ValueError("coalesce_ms must be non-negative")
+            raise ValueError("coalesce_ms must be non-negative")  # noqa: TRY003
         if cache_size < 0:
-            raise ValueError("cache_size must be non-negative")
+            raise ValueError("cache_size must be non-negative")  # noqa: TRY003
         self._model = model
-        self._max_batch_size = max_batch_size
+        self._max_batch_size = int(max_batch_size)
         self._coalesce_seconds = coalesce_ms / 1000.0
-        self._cache_size = cache_size
+        self._cache_size = int(cache_size)
         self._cache: OrderedDict[str, tuple[float, ...]] = OrderedDict()
         self._lock = asyncio.Lock()
-        self._active_calls: list[_CallContext] = []
-        self._text_to_batch: dict[str, _BatchExecution] = {}
-        self._scheduled = False
+        self._slots: dict[str, _Slot] = {}
+        self._pending: list[str] = []
+        self._round: asyncio.Task[None] | None = None
+        self._tasks: set[asyncio.Task[None]] = set()
 
     @property
     def profile(self) -> Any:
@@ -80,193 +84,165 @@ class CoalescingEmbeddingModel:
         if not texts:
             return EmbeddingResult(vectors=(), usage=InferenceUsage(requests=0))
 
-        current_task = asyncio.current_task()
-        unique_texts = list(dict.fromkeys(texts))
-
-        cache_hits: dict[str, tuple[float, ...]] = {}
-        call_context = _CallContext(task=current_task, texts=unique_texts)
+        unique = list(dict.fromkeys(texts))
+        cached: dict[str, tuple[float, ...]] = {}
+        slots: dict[str, _Slot] = {}
 
         async with self._lock:
-            for text in unique_texts:
+            for text in unique:
                 if text in self._cache:
                     self._cache.move_to_end(text)
-                    cache_hits[text] = self._cache[text]
+                    cached[text] = self._cache[text]
+                    continue
+                slot = self._slots.get(text)
+                if slot is None:
+                    slot = _Slot(text=text, future=asyncio.get_running_loop().create_future())
+                    # A text whose only caller disappears must not leave an
+                    # unretrieved failure behind in the event loop.
+                    slot.future.add_done_callback(_consume_outcome)
+                    self._slots[text] = slot
+                    self._pending.append(text)
+                slots[text] = slot
+            if self._pending and (self._round is None or self._round.done()):
+                self._round = self._spawn(self._run_round())
 
-            texts_needing_work = [t for t in unique_texts if t not in cache_hits]
-
-            if texts_needing_work:
-                self._active_calls.append(call_context)
-
-                for text in texts_needing_work:
-                    if text in self._text_to_batch:
-                        batch = self._text_to_batch[text]
-                        call_context.batches.append(batch)
-                        call_context.text_to_batch[text] = batch
-                    else:
-                        pass
-
-                if not self._scheduled and self._active_calls:
-                    self._scheduled = True
-                    asyncio.create_task(self._process_coalesced_batches())
-
-        if texts_needing_work:
-            try:
-                await call_context.event.wait()
-            except asyncio.CancelledError:
-                async with self._lock:
-                    if call_context in self._active_calls:
-                        self._active_calls.remove(call_context)
-                raise
-
-        result_vectors: list[tuple[float, ...]] = []
-        usage_requests = 0
-        usage_input_tokens: int | None = None
-        usage_output_tokens: int | None = None
-
-        waited_batches: set[int] = set()
-
+        vectors: list[tuple[float, ...]] = []
+        batches: dict[int, _Batch] = {}
         for text in texts:
-            if text in cache_hits:
-                result_vectors.append(cache_hits[text])
-            else:
-                batch = call_context.text_to_batch.get(text)
-                if batch is None:
-                    raise ValueError(f"No batch found for text: {text!r}")
+            if text in cached:
+                vectors.append(cached[text])
+                continue
+            slot = slots[text]
+            vectors.append(await asyncio.shield(slot.future))
+            if slot.batch is not None:
+                batches[id(slot.batch)] = slot.batch
 
-                batch_id = id(batch)
-                if batch_id not in waited_batches:
-                    try:
-                        batch_result = await asyncio.shield(batch.future)
-                        waited_batches.add(batch_id)
-
-                        if batch.usage.requests > 0:
-                            usage_requests += 1
-                            if batch.usage.input_tokens is not None:
-                                usage_input_tokens = (usage_input_tokens or 0) + batch.usage.input_tokens
-                            if batch.usage.output_tokens is not None:
-                                usage_output_tokens = (usage_output_tokens or 0) + batch.usage.output_tokens
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception:
-                        raise
-
-                vector_map = batch.future.result() if batch.future.done() else {}
-                if text not in vector_map:
-                    raise ValueError(f"Embedding model did not return a vector for text: {text!r}")
-                result_vectors.append(vector_map[text])
-
-        return EmbeddingResult(
-            vectors=tuple(result_vectors),
-            usage=InferenceUsage(
-                requests=usage_requests,
-                input_tokens=usage_input_tokens,
-                output_tokens=usage_output_tokens,
-            ),
-        )
-
-    async def _process_coalesced_batches(self) -> None:
-        if self._coalesce_seconds > 0:
-            await asyncio.sleep(self._coalesce_seconds)
-
-        async with self._lock:
-            all_texts = []
-            seen = set()
-            calls_to_notify = list(self._active_calls)
-
-            for call in calls_to_notify:
-                for text in call.texts:
-                    if text not in seen and text not in self._text_to_batch:
-                        all_texts.append(text)
-                        seen.add(text)
-
-            for call in calls_to_notify:
-                if call in self._active_calls:
-                    self._active_calls.remove(call)
-
-            self._scheduled = False
-
-        if not all_texts:
-            for call in calls_to_notify:
-                call.event.set()
-            return
-
-        batches: list[_BatchExecution] = []
-        text_to_batch: dict[str, _BatchExecution] = {}
-
-        for i in range(0, len(all_texts), self._max_batch_size):
-            batch_texts = tuple(all_texts[i:i + self._max_batch_size])
-            future = asyncio.get_running_loop().create_future()
-            batch = _BatchExecution(texts=batch_texts, future=future)
-            batches.append(batch)
-            for text in batch_texts:
-                text_to_batch[text] = batch
-            asyncio.create_task(self._execute_batch(batch))
-
-        async with self._lock:
-            self._text_to_batch.update(text_to_batch)
-
-            for call in calls_to_notify:
-                for text in call.texts:
-                    if text in text_to_batch:
-                        batch = text_to_batch[text]
-                        if batch not in call.batches:
-                            call.batches.append(batch)
-                        call.text_to_batch[text] = batch
-
-        for call in calls_to_notify:
-            call.event.set()
-
-    async def _execute_batch(self, batch: _BatchExecution) -> None:
-        try:
-            result = await self._model.embed(batch.texts)
-
-            if len(result.vectors) != len(batch.texts):
-                raise ValueError(
-                    f"Embedding model returned {len(result.vectors)} vectors for {len(batch.texts)} texts"
-                )
-
-            vector_map = dict(zip(batch.texts, result.vectors, strict=True))
-            batch.usage = result.usage
-
-            async with self._lock:
-                if self._cache_size > 0:
-                    for text, vector in vector_map.items():
-                        if text in self._cache:
-                            self._cache.move_to_end(text)
-                        else:
-                            self._cache[text] = vector
-                            if len(self._cache) > self._cache_size:
-                                evicted_key, _ = self._cache.popitem(last=False)
-                                if evicted_key in self._text_to_batch:
-                                    del self._text_to_batch[evicted_key]
-
-            if not batch.future.done():
-                batch.future.set_result(vector_map)
-
-        except asyncio.CancelledError:
-            async with self._lock:
-                self._release_batch(batch)
-            if not batch.future.done():
-                batch.future.cancel()
-            raise
-
-        except Exception as error:
-            async with self._lock:
-                # A failed batch must not be reused: the next call has to run the
-                # underlying model again rather than replay the same failure.
-                self._release_batch(batch)
-            if not batch.future.done():
-                batch.future.set_exception(error)
-
-    def _release_batch(self, batch: _BatchExecution) -> None:
-        """Drop a finished batch so later calls start fresh work."""
-
-        for text in batch.texts:
-            if self._text_to_batch.get(text) is batch:
-                del self._text_to_batch[text]
+        return EmbeddingResult(vectors=tuple(vectors), usage=_merge_usage(batches.values()))
 
     async def embed_query(self, texts: tuple[str, ...], /) -> EmbeddingResult:
         return await self.embed(texts)
+
+    async def _run_round(self) -> None:
+        """Close one coalescing window and turn the collected texts into batches."""
+
+        if self._coalesce_seconds > 0:
+            await asyncio.sleep(self._coalesce_seconds)
+        async with self._lock:
+            texts = list(self._pending)
+            self._pending.clear()
+            self._round = None
+            batches = [
+                _Batch(texts=tuple(chunk), slots=tuple(self._slots[text] for text in chunk))
+                for chunk in _chunks(texts, self._max_batch_size)
+            ]
+            for batch in batches:
+                for slot in batch.slots:
+                    slot.batch = batch
+        if not batches:
+            return
+        await asyncio.gather(*(self._execute_batch(batch) for batch in batches), return_exceptions=True)
+
+    async def _execute_batch(self, batch: _Batch) -> None:
+        try:
+            result = await self._model.embed(batch.texts)
+            vectors = _checked_vectors(batch.texts, result.vectors)
+            batch.usage = result.usage
+            self._cache_vectors(vectors)
+        except asyncio.CancelledError:
+            _fail(batch, asyncio.CancelledError())
+            raise
+        except Exception as error:
+            # A failed batch is never cached, so the next caller retries it.
+            _fail(batch, error)
+        else:
+            _settle(batch, vectors)
+        finally:
+            self._release(batch)
+
+    def _cache_vectors(self, vectors: dict[str, tuple[float, ...]]) -> None:
+        if self._cache_size <= 0:
+            return
+        for text, vector in vectors.items():
+            if text in self._cache:
+                self._cache.move_to_end(text)
+            else:
+                self._cache[text] = vector
+            while len(self._cache) > self._cache_size:
+                self._cache.popitem(last=False)
+
+    def _release(self, batch: _Batch) -> None:
+        """Stop tracking a finished request so later calls start fresh work.
+
+        The registry only changes without an intervening await, so the removal
+        cannot interleave with a call that registers the same text.
+        """
+
+        for slot in batch.slots:
+            if self._slots.get(slot.text) is slot:
+                del self._slots[slot.text]
+
+    def _spawn(self, coroutine: Any) -> asyncio.Task[None]:
+        task = asyncio.create_task(coroutine)
+        self._tasks.add(task)
+        task.add_done_callback(self._retire)
+        return task
+
+    def _retire(self, task: asyncio.Task[None]) -> None:
+        self._tasks.discard(task)
+        if not task.cancelled():
+            task.exception()
+
+
+def _chunks(texts: Sequence[str], size: int) -> Iterator[Sequence[str]]:
+    for start in range(0, len(texts), size):
+        yield texts[start : start + size]
+
+
+def _checked_vectors(texts: tuple[str, ...], vectors: tuple[tuple[float, ...], ...]) -> dict[str, tuple[float, ...]]:
+    """Pair the provider vectors with the texts they belong to."""
+
+    if len(vectors) != len(texts):
+        raise ValueError(  # noqa: TRY003
+            f"Embedding model returned {len(vectors)} vectors for {len(texts)} texts"
+        )
+    return dict(zip(texts, vectors, strict=True))
+
+
+def _settle(batch: _Batch, vectors: dict[str, tuple[float, ...]]) -> None:
+    """Resolve every slot that waits for this batch."""
+
+    for slot in batch.slots:
+        if not slot.future.done():
+            slot.future.set_result(vectors[slot.text])
+
+
+def _fail(batch: _Batch, error: BaseException) -> None:
+    """Report a failed batch to every slot that waits for it."""
+
+    for slot in batch.slots:
+        if not slot.future.done():
+            slot.future.set_exception(error)
+
+
+def _consume_outcome(future: asyncio.Future[Any]) -> None:
+    if not future.cancelled():
+        future.exception()
+
+
+def _merge_usage(batches: Iterable[_Batch]) -> InferenceUsage:
+    """Sum the provider usage of the distinct batches one call waited for."""
+
+    requests = 0
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    for batch in batches:
+        usage = batch.usage
+        requests += usage.requests
+        if usage.input_tokens is not None:
+            input_tokens = (input_tokens or 0) + usage.input_tokens
+        if usage.output_tokens is not None:
+            output_tokens = (output_tokens or 0) + usage.output_tokens
+    return InferenceUsage(requests=requests, input_tokens=input_tokens, output_tokens=output_tokens)
 
 
 __all__ = ["CoalescingEmbeddingModel"]
