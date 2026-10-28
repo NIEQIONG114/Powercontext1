@@ -100,14 +100,22 @@ LIMIT :candidate_limit
 # One statement, two native candidate sets. Each branch keeps its own index plan:
 # the full-text branch retrieves through the FULLTEXT index and the vector branch
 # through the HNSW index, so a single round trip carries both channels.
+#
+# The version join stays inside each branch. A join above the ordered branches
+# re-sorts their rows and would drop the ranking the native indexes produced.
 _OCEANBASE_HYBRID_SEARCH_SQL = """
 WITH fts_candidates AS (
     SELECT
         f.memory_artifact_id,
         f.head_revision,
         f.entry_id,
-        f.entry_version_id
+        f.entry_version_id,
+        v.text
     FROM pc_memory_entry_heads AS f
+    JOIN pc_memory_entry_versions AS v
+      ON v.scope_id = f.scope_id
+     AND v.memory_artifact_id = f.memory_artifact_id
+     AND v.entry_version_id = f.entry_version_id
     WHERE f.scope_id = :scope_id
       AND f.memory_artifact_id IN :memory_artifact_ids
       AND MATCH (f.searchable_text) AGAINST (:analyzed_query)
@@ -124,8 +132,13 @@ vector_candidates AS (
         m.head_revision,
         m.entry_id,
         m.entry_version_id,
+        v.text,
         l2_distance(m.embedding, :query_vector) AS distance
     FROM pc_memory_vector_entries AS m
+    JOIN pc_memory_entry_versions AS v
+      ON v.scope_id = m.scope_id
+     AND v.memory_artifact_id = m.memory_artifact_id
+     AND v.entry_version_id = m.entry_version_id
     WHERE m.scope_id = :scope_id
       AND m.memory_artifact_id IN :memory_artifact_ids
       {vector_tag}
@@ -138,13 +151,9 @@ SELECT
     c.head_revision,
     c.entry_id,
     c.entry_version_id,
-    v.text,
+    c.text,
     NULL AS distance
 FROM fts_candidates AS c
-JOIN pc_memory_entry_versions AS v
-  ON v.scope_id = :scope_id
- AND v.memory_artifact_id = c.memory_artifact_id
- AND v.entry_version_id = c.entry_version_id
 UNION ALL
 SELECT
     'vector' AS channel,
@@ -152,13 +161,9 @@ SELECT
     c.head_revision,
     c.entry_id,
     c.entry_version_id,
-    v.text,
+    c.text,
     c.distance
 FROM vector_candidates AS c
-JOIN pc_memory_entry_versions AS v
-  ON v.scope_id = :scope_id
- AND v.memory_artifact_id = c.memory_artifact_id
- AND v.entry_version_id = c.entry_version_id
 """
 
 
@@ -590,9 +595,7 @@ class OceanBaseMemoryHybridIndex:
         )
         self.tables: tuple[Table, ...] = ()
         vector_type = VECTOR(vector_index.profile.dimension)
-        self._search_sql = text(
-            _OCEANBASE_HYBRID_SEARCH_SQL.format(fts_tag="", vector_tag="")
-        ).bindparams(
+        self._search_sql = text(_OCEANBASE_HYBRID_SEARCH_SQL.format(fts_tag="", vector_tag="")).bindparams(
             bindparam("memory_artifact_ids", expanding=True),
             bindparam("query_vector", type_=vector_type),
         )
@@ -621,9 +624,7 @@ class OceanBaseMemoryHybridIndex:
             return MemorySearchChannels()
         if request.embedding_profile != self.profile or request.query_vector is None:
             raise CapabilityNotSupportedError("embedding-profile")
-        if not await self._vector.vector_complete(
-            connection, scope_id, request.memories, self.profile
-        ):
+        if not await self._vector.vector_complete(connection, scope_id, request.memories, self.profile):
             raise CapabilityNotSupportedError("vector")
         rows = (
             await connection.execute(
