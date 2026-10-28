@@ -21,13 +21,13 @@
 
 改造现有 seekdb 后端的候选查询，复用已有 schema、产品传入的 `AsyncConnection` 和共享环境中的 `pylibseekdb==1.3.0.post4`。不得启动独立查询服务或替换数据库、查询引擎。
 
-`mode="hybrid"` 的一次候选检索须恰好执行一条 seekdb statement，同时包含全文与向量候选。该限制只针对候选检索，后续精确正文读取仍遵循产品流程。不能先执行两条候选 SQL，再在应用层合并。
+`mode="hybrid"` 的一次候选检索须恰好执行一条 seekdb statement，同时包含全文与向量候选。该限制只针对候选检索：候选之前的当前 head 校验与向量完整性校验沿用现有 backend 行为，不计入候选 SQL 数量；候选之后的精确正文读取仍遵循产品流程。不能先执行两条候选 SQL，再在应用层合并。
 
 FTS-only 和 vector-only 的公开行为保持不变，embedding 不完整时的处理不属于本题范围。禁止按固定文档、query、主题或测试顺序硬编码结果。
 
 ### 2.2 接口与数据
 
-沿用冻结 schema 的 `pc_memory_entry_heads` 和 `pc_memory_vector_entries`。结果可使用 `MemorySearchChannels` 或等价的后端中立结构，保留 `memory_artifact_id`、`head_revision`、`entry_id` 与 `entry_version_id`。单 statement 可返回两路有序候选后再融合，也可采用其他符合契约的结果结构和融合方式。
+沿用冻结 schema 的 `pc_memory_entry_heads` 和 `pc_memory_vector_entries`。结果可使用 `MemorySearchChannels` 或等价的后端中立结构，保留 `memory_artifact_id`、`head_revision`、`entry_id` 与 `entry_version_id`。单 statement 可返回两路有序候选后再融合，也可采用其他符合契约的结果结构和融合方式；候选 SQL 可以同时带回正文，也可以只返回身份再由产品流程精确读取，两种做法都不改变候选数量与两路的原生次序。
 
 质量输入包含 173 篇真实文档、20 条原始 query，使用固定的 384 维单位向量和 L2 `EmbeddingProfile`，返回上限为 `limit=10`。人工 qrels 只用于评分。
 
@@ -37,6 +37,8 @@ FTS-only 和 vector-only 的公开行为保持不变，embedding 不完整时的
 | --- | --- |
 | 原生索引 | 实际 SQL 的 EXPLAIN 同时显示 `TEXT RETRIEVAL SCAN` 和 `VECTOR INDEX`，不能全表扫描后在 Python 计算匹配或距离 |
 | 数据库内过滤 | scope、Memory artifact、tag filter 与 candidate limit 在数据库内生效 |
+| 候选上限 | `candidate_limit` 对两路分别生效，全文与向量各取至多 `candidate_limit` 条候选。 |
+| 候选顺序 | 两路候选各自保持原生索引给出的顺序，融合、截断与正文读取在应用层完成；候选 SQL 内的连接与排序不得打乱两路的原生次序。 |
 | 当前 head | 沿用现有 backend 校验；历史 head 按现有 capability contract 拒绝 |
 | 增量投影 | 未修改条目的 projection 可保留旧 `head_revision`，不能因此排除仍活跃的条目；返回引用使用请求中已验证的当前 Memory head |
 | 状态变化 | 追加、正文修订、停用和恢复后，索引、正文及当前状态一致 |
@@ -62,7 +64,7 @@ FTS-only 和 vector-only 的公开行为保持不变，embedding 不完整时的
 | 验收类别 | 通过条件 |
 | --- | --- |
 | 功能 | 原生索引、过滤、当前版本、状态变化、引用、重复查询稳定性和单通道行为符合契约 |
-| 候选访问成本 | 每条 hybrid query 恰好执行一条包含全文与向量候选的 SQL |
+| 候选访问成本 | 每条 hybrid query 恰好执行一条包含全文与向量候选的 SQL；当前 head 校验与向量完整性校验不计入 |
 | 命中有效性 | 20 个 query、三个独立 scope 共 60 次查询，所有命中的当前版本、正文及通道标识有效，且没有重复身份 |
 | 逐查询质量 | 与同库冻结双查询路径相比，每条 query 的 Recall@10、MRR@10 均不降低 |
 | 平均召回 | 60 次查询的 `evidence_recall_at_10 >= 0.95` |

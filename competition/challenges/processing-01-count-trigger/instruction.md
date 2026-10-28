@@ -34,15 +34,15 @@ topic_memory_source_count_threshold: int | None = None
 
 ### 2.3 关键行为与约束
 
-数量按每个作用域（scope）、每个处理族（family）独立计算：从该处理器最后一次成功提交的 Source 游标（cursor）之后，到当前 journal 末尾的新条目数。首次处理从 cursor 0 开始。计数依据已持久化的 journal 身份，不依据正文长度、token 数或生成结果数。同一身份的重复 capture、已有 Source 的 receipt 信任升级不增加计数。只允许用于 lineage 的服务端 Source 也占一个 journal 条目；它参与启动计数，仍按原有规则从生成证据中排除。
+数量按每个作用域（scope）、每个处理族（family）独立计算：从该处理器最后一次成功提交的 Source 游标（cursor）之后，到当前 journal 末尾的新条目数。待处理条数等于该 scope 的 journal 位置减去该处理族的成功游标序号，尚未提交过游标时按游标 0 计算。首次处理从 cursor 0 开始。计数依据已持久化的 journal 身份，不依据正文长度、token 数或生成结果数。同一身份的重复 capture、已有 Source 的 receipt 信任升级不增加计数。只允许用于 lineage 的服务端 Source 也占一个 journal 条目；它参与启动计数，仍按原有规则从生成证据中排除。
 
-达到门槛后，Runtime 应自动接受并执行一次原有处理调用，无需显式 flush 或等待时间条件。数量条件与已有时间条件为 OR；任一条件满足即可启动。`None` 保持原有时间行为。显式 `memory.for_scope(...).flush()` 和 `topic_memory.for_scope(...).flush()` 绕过数量门槛。
+达到门槛后，Runtime 应自动接受并执行一次原有处理调用，无需显式 flush 或等待时间条件。新条目写入后，数量条件在 Supervisor 的下一次检查时判定，该检查周期不超过 1 秒。数量条件与已有时间条件为 OR；任一条件满足即可启动。`None` 保持原有时间行为。显式 `memory.for_scope(...).flush()` 和 `topic_memory.for_scope(...).flush()` 绕过数量门槛。
 
 沿用既有处理器的消费方式。`source_window_limit` 与 `topic_memory_source_window_limit` 仍是每次读取的上限。Memory 成功后按新 cursor 重新判断剩余数量；不足门槛时等待新增输入、时间条件或显式 flush。Topic Memory 已接受的处理批次（wave）继续按原有分窗行为完成，不把门槛重新施加到它的后续窗口。
 
 例如，Memory 门槛为 3、窗口上限为 1，捕获 3 个新条目后自动处理 1 个，剩余 2 个暂不再次数量触发。再捕获 1 个新条目后，待处理数回到 3，自动处理下一窗，剩余 2 个继续等待。不得把一次达到门槛解释成 Memory 必须排空全部输入。
 
-已经接受的调用失败后沿用原有重试，不因重新检查门槛丢弃工作；失败不消耗成功 cursor。关闭并重开同一数据库后，既要保留不足门槛的待处理输入，也要恢复已达到门槛但尚未成功的处理。成功后不能把已消费的历史条目重新计入门槛。不同 scope 及 Memory、Topic Memory 的 cursor 与门槛互不替代。
+已经接受的调用失败后沿用原有重试，不因重新检查门槛丢弃工作；失败不消耗成功 cursor。关闭并重开同一数据库后，既要保留不足门槛的待处理输入，也要恢复已达到门槛但尚未成功的处理：重启后不足门槛的输入保持待处理，已被接受的工作继续按既有重试与恢复规则处理。成功后不能把已消费的历史条目重新计入门槛。不同 scope 及 Memory、Topic Memory 的 cursor 与门槛互不替代。
 
 处理后的 Source 引用必须能通过公开接口读取，重启后仍可读。实现可选择等价的调度与持久化方式，不要求新增特定 checkpoint、队列或 helper。
 
