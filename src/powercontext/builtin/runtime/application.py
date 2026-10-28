@@ -143,6 +143,7 @@ from powercontext.builtin.persistence.artifact_governance import (
     ArtifactGovernance,
     ArtifactLifecycleState,
 )
+from powercontext.builtin.persistence.database import AsyncDatabase
 from powercontext.builtin.persistence.skill_publications import SkillPublication
 from powercontext.builtin.publication import ArtifactPublicationApplication
 from powercontext.builtin.records import (
@@ -248,6 +249,7 @@ from powercontext.builtin.runtime.recall_sufficiency import (
     build_recall_candidates,
     recall_effort,
 )
+from powercontext.builtin.runtime.source_lifecycle import SourceLifecycleService
 from powercontext.builtin.runtime.statistics import RelationalScopedStatistics, overview_selection
 from powercontext.builtin.scope import ScopeApplication, ScopeDescriptor, ScopeSelection
 from powercontext.builtin.scope.subject_sources import SubjectSourceService
@@ -516,6 +518,19 @@ class SourceApplication:
 
     def for_scope(self, scope_id: str, /) -> ScopedSourceApplication:
         return ScopedSourceApplication(self._runtime, scope_id)
+
+
+class SourceLifecycleApplication:
+    """Select the scoped Source lifecycle service."""
+
+    def __init__(self, runtime: BuiltinRuntime, database: AsyncDatabase | None) -> None:
+        self._runtime = runtime
+        self._database = database
+
+    def for_scope(self, scope_id: str, /) -> SourceLifecycleService:
+        if self._database is None:
+            raise _RuntimeStateError("source-lifecycle")
+        return SourceLifecycleService(self._runtime, validate_scope_id(scope_id), self._database)
 
 
 class ScopedRecordApplication:
@@ -857,23 +872,16 @@ class ScopedContextApplication:
         authorize_scopes: Callable[[tuple[str, ...]], Awaitable[None]] | None = None,
     ) -> ContextPack | ContextPackDelta:
         """Prepare context incrementally, returning a full pack or delta.
-        
-        If base_pack is None, returns a complete ContextPack.
-        If base_pack is provided, returns a ContextPackDelta relative to it.
+
+        Without a base pack the result is a complete ContextPack; with one the
+        result is the delta that turns the base pack into the current content.
         """
         from powercontext.builtin.runtime.context_pack import ContextPack, ContextPackDelta
-        
-        # Get the full prepared context
+
         prepared = await self.prepare(request, authorize_scopes=authorize_scopes)
-        
-        # Build target pack from content
-        content = prepared.content or ""
-        target_pack = ContextPack.from_content(content)
-        
+        target_pack = ContextPack.from_content(prepared.content or "")
         if base_pack is None:
             return target_pack
-        
-        # Create delta from base to target
         return ContextPackDelta.between(base_pack, target_pack)
 
     async def _prepare(self, request: PrepareContextRequest, scope: ScopeDescriptor, /) -> PreparedContext:
@@ -3056,6 +3064,7 @@ class BuiltinRuntime:
         remote_ingestion: RemoteIngestion | None = None,
         dream_service: DreamService | None = None,
         generation_concurrency: int = 4,
+        source_lifecycle_database: AsyncDatabase | None = None,
     ) -> None:
         if source_window_limit < 1:
             raise _RuntimeConfigurationError("source_window_limit")
@@ -3129,6 +3138,7 @@ class BuiltinRuntime:
         self._scheduler: AsyncIOScheduler | None = None
         self._scheduler_runtime_key: str | None = None
         self.sources = SourceApplication(self)
+        self.lifecycle = SourceLifecycleApplication(self, source_lifecycle_database)
         self.ingestion = RemoteIngestionApplication(self, remote_ingestion)
         self.code = CodeApplication(self, code_service or CodeService(CodeConfig()))
         self.context = ContextApplication(self)
