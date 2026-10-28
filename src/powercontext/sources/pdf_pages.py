@@ -215,7 +215,7 @@ async def search_pdf_pages(
     Returns up to `limit` distinct MemoryCitation objects for pages
     matching the natural language question.
     """
-    from powercontext.builtin.artifacts.memory import SearchMemoryRequest
+    from powercontext.builtin.runtime.models import SearchMemoryRequest
 
     request = SearchMemoryRequest(
         query=question,
@@ -237,7 +237,7 @@ async def search_pdf_pages(
             entry_version_id=hit.entry_version_id,
         )
 
-        citation_key = (hit.memory_ref, hit.entry_id, hit.entry_version_id)
+        citation_key = (hit.memory_ref.artifact_id, hit.entry_id, hit.entry_version_id)
         if citation_key not in seen:
             seen.add(citation_key)
             citations.append(citation)
