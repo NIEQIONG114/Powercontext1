@@ -58,17 +58,17 @@ class ContextPack:
         """
         if chunk_bytes < 1:
             raise ContextPackError("chunk_bytes must be positive")
-        
+
         content_bytes = content.encode("utf-8")
         if not content_bytes:
             return cls.build(())
-        
+
         items: list[bytes] = []
         pos = 0
         while pos < len(content_bytes):
             # Find the largest end position <= pos + chunk_bytes that is a valid UTF-8 boundary
             end = min(pos + chunk_bytes, len(content_bytes))
-            
+
             # Try to decode the chunk; if it fails, we need to back up to find a valid boundary
             while end > pos:
                 chunk = content_bytes[pos:end]
@@ -82,10 +82,10 @@ class ContextPack:
                 raise ContextPackError(
                     f"cannot form valid UTF-8 chunk within {chunk_bytes} bytes"
                 )
-            
+
             items.append(chunk)
             pos = end
-        
+
         return cls.build(tuple(items))
 
     def to_bytes(self) -> bytes:
@@ -114,7 +114,7 @@ class ContextPack:
             payload = json.loads(data)
         except json.JSONDecodeError as e:
             raise ContextPackError(f"invalid JSON: {e}") from e
-        
+
         # Validate required fields
         required = {"schema", "items", "digest", "byte_count"}
         if set(payload.keys()) != required:
@@ -126,26 +126,26 @@ class ContextPack:
             if extra:
                 parts.append(f"extra: {extra}")
             raise ContextPackError(f"invalid pack fields: {', '.join(parts)}")
-        
+
         if payload["schema"] != PACK_SCHEMA:
             raise ContextPackError(f"invalid schema: {payload['schema']}")
-        
+
         # Decode items
         try:
             items = tuple(base64.b64decode(item) for item in payload["items"])
         except Exception as e:
             raise ContextPackError(f"invalid base64 encoding: {e}") from e
-        
+
         # Verify digest
         expected_digest = _compute_digest(items)
         if payload["digest"] != expected_digest:
             raise ContextPackError("digest mismatch")
-        
+
         # Verify byte_count
         pack = cls(items=items, digest=payload["digest"], byte_count=payload["byte_count"])
         if pack.byte_count != payload["byte_count"]:
             raise ContextPackError("byte_count mismatch")
-        
+
         return pack
 
 
@@ -173,7 +173,7 @@ class ContextPackDelta:
                 prefix_len = i + 1
             else:
                 break
-        
+
         appended = target.items[prefix_len:]
         return cls(
             base_digest=base.digest,
@@ -200,7 +200,7 @@ class ContextPackDelta:
             payload = json.loads(data)
         except json.JSONDecodeError as e:
             raise ContextPackError(f"invalid JSON: {e}") from e
-        
+
         # Validate required fields
         required = {"schema", "base_digest", "target_digest", "prefix_items", "appended"}
         if set(payload.keys()) != required:
@@ -212,23 +212,23 @@ class ContextPackDelta:
             if extra:
                 parts.append(f"extra: {extra}")
             raise ContextPackError(f"invalid delta fields: {', '.join(parts)}")
-        
+
         if payload["schema"] != DELTA_SCHEMA:
             raise ContextPackError(f"invalid schema: {payload['schema']}")
-        
+
         # Validate prefix_items
         prefix = payload["prefix_items"]
         if not isinstance(prefix, int) or isinstance(prefix, bool):
             raise ContextPackError(f"prefix_items must be integer, got {type(prefix).__name__}")
         if prefix < 0:
             raise ContextPackError(f"prefix_items must be non-negative, got {prefix}")
-        
+
         # Decode appended
         try:
             appended = tuple(base64.b64decode(item) for item in payload["appended"])
         except Exception as e:
             raise ContextPackError(f"invalid base64 encoding: {e}") from e
-        
+
         return cls(
             base_digest=payload["base_digest"],
             target_digest=payload["target_digest"],
@@ -242,23 +242,23 @@ def apply_context_pack_delta(base: ContextPack, delta: ContextPackDelta) -> Cont
     # Validate base digest
     if base.digest != delta.base_digest:
         raise ContextPackError("base digest mismatch")
-    
+
     # Validate prefix_items bounds
     if delta.prefix_items > len(base.items):
         raise ContextPackError(
             f"prefix_items {delta.prefix_items} exceeds base items count {len(base.items)}"
         )
-    
+
     # Reconstruct target items
     target_items = base.items[:delta.prefix_items] + delta.appended
-    
+
     # Build target pack
     target = ContextPack.build(target_items)
-    
+
     # Validate target digest
     if target.digest != delta.target_digest:
         raise ContextPackError("target digest mismatch after reconstruction")
-    
+
     return target
 
 

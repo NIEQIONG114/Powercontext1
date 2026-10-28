@@ -694,14 +694,16 @@ class ArtifactProcessingSupervisor:
         rows = await connection.execute(
             select(SOURCE_JOURNAL_HEADS_TABLE.c.scope_id, SOURCE_JOURNAL_HEADS_TABLE.c.position)
         )
-        counts: dict[str, int] = {}
-        for scope_id, position in rows:
-            cursor = await SourceCursorRepository().load(
-                connection, scope_id, binding.binding_name, for_update=False
-            )
-            processed = 0 if cursor is None else cursor.cursor.sequence
-            counts[str(scope_id)] = int(position) - processed
-        return counts
+        positions = {str(scope_id): int(position) for scope_id, position in rows}
+        if not positions:
+            return {}
+        cursors = await SourceCursorRepository().load_many(
+            connection, tuple(positions), binding.binding_name
+        )
+        return {
+            scope_id: position - cursors[scope_id].cursor.sequence if scope_id in cursors else position
+            for scope_id, position in positions.items()
+        }
 
     async def _discover_requested(self, state: _FamilyState) -> None:
         capacity = self._fresh_capacity(state)

@@ -20,8 +20,6 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncConnection
 
 from powercontext.artifacts import ArtifactRef, MemoryCitation
 from powercontext.builtin.persistence.database import AsyncDatabase

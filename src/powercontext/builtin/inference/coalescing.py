@@ -82,21 +82,21 @@ class CoalescingEmbeddingModel:
 
         current_task = asyncio.current_task()
         unique_texts = list(dict.fromkeys(texts))
-        
+
         cache_hits: dict[str, tuple[float, ...]] = {}
         call_context = _CallContext(task=current_task, texts=unique_texts)
-        
+
         async with self._lock:
             for text in unique_texts:
                 if text in self._cache:
                     self._cache.move_to_end(text)
                     cache_hits[text] = self._cache[text]
-            
+
             texts_needing_work = [t for t in unique_texts if t not in cache_hits]
-            
+
             if texts_needing_work:
                 self._active_calls.append(call_context)
-                
+
                 for text in texts_needing_work:
                     if text in self._text_to_batch:
                         batch = self._text_to_batch[text]
@@ -104,7 +104,7 @@ class CoalescingEmbeddingModel:
                         call_context.text_to_batch[text] = batch
                     else:
                         pass
-                
+
                 if not self._scheduled and self._active_calls:
                     self._scheduled = True
                     asyncio.create_task(self._process_coalesced_batches())
@@ -117,14 +117,14 @@ class CoalescingEmbeddingModel:
                     if call_context in self._active_calls:
                         self._active_calls.remove(call_context)
                 raise
-        
+
         result_vectors: list[tuple[float, ...]] = []
         usage_requests = 0
         usage_input_tokens: int | None = None
         usage_output_tokens: int | None = None
-        
+
         waited_batches: set[int] = set()
-        
+
         for text in texts:
             if text in cache_hits:
                 result_vectors.append(cache_hits[text])
@@ -132,13 +132,13 @@ class CoalescingEmbeddingModel:
                 batch = call_context.text_to_batch.get(text)
                 if batch is None:
                     raise ValueError(f"No batch found for text: {text!r}")
-                
+
                 batch_id = id(batch)
                 if batch_id not in waited_batches:
                     try:
                         batch_result = await asyncio.shield(batch.future)
                         waited_batches.add(batch_id)
-                        
+
                         if batch.usage.requests > 0:
                             usage_requests += 1
                             if batch.usage.input_tokens is not None:
@@ -149,7 +149,7 @@ class CoalescingEmbeddingModel:
                         raise
                     except Exception:
                         raise
-                
+
                 vector_map = batch.future.result() if batch.future.done() else {}
                 if text not in vector_map:
                     raise ValueError(f"Embedding model did not return a vector for text: {text!r}")
@@ -167,32 +167,32 @@ class CoalescingEmbeddingModel:
     async def _process_coalesced_batches(self) -> None:
         if self._coalesce_seconds > 0:
             await asyncio.sleep(self._coalesce_seconds)
-        
+
         async with self._lock:
             all_texts = []
             seen = set()
             calls_to_notify = list(self._active_calls)
-            
+
             for call in calls_to_notify:
                 for text in call.texts:
                     if text not in seen and text not in self._text_to_batch:
                         all_texts.append(text)
                         seen.add(text)
-            
+
             for call in calls_to_notify:
                 if call in self._active_calls:
                     self._active_calls.remove(call)
-            
+
             self._scheduled = False
-        
+
         if not all_texts:
             for call in calls_to_notify:
                 call.event.set()
             return
-        
+
         batches: list[_BatchExecution] = []
         text_to_batch: dict[str, _BatchExecution] = {}
-        
+
         for i in range(0, len(all_texts), self._max_batch_size):
             batch_texts = tuple(all_texts[i:i + self._max_batch_size])
             future = asyncio.get_running_loop().create_future()
@@ -201,10 +201,10 @@ class CoalescingEmbeddingModel:
             for text in batch_texts:
                 text_to_batch[text] = batch
             asyncio.create_task(self._execute_batch(batch))
-        
+
         async with self._lock:
             self._text_to_batch.update(text_to_batch)
-            
+
             for call in calls_to_notify:
                 for text in call.texts:
                     if text in text_to_batch:
@@ -212,22 +212,22 @@ class CoalescingEmbeddingModel:
                         if batch not in call.batches:
                             call.batches.append(batch)
                         call.text_to_batch[text] = batch
-        
+
         for call in calls_to_notify:
             call.event.set()
 
     async def _execute_batch(self, batch: _BatchExecution) -> None:
         try:
             result = await self._model.embed(batch.texts)
-            
+
             if len(result.vectors) != len(batch.texts):
                 raise ValueError(
                     f"Embedding model returned {len(result.vectors)} vectors for {len(batch.texts)} texts"
                 )
-            
+
             vector_map = dict(zip(batch.texts, result.vectors, strict=True))
             batch.usage = result.usage
-            
+
             async with self._lock:
                 if self._cache_size > 0:
                     for text, vector in vector_map.items():
@@ -239,10 +239,10 @@ class CoalescingEmbeddingModel:
                                 evicted_key, _ = self._cache.popitem(last=False)
                                 if evicted_key in self._text_to_batch:
                                     del self._text_to_batch[evicted_key]
-            
+
             if not batch.future.done():
                 batch.future.set_result(vector_map)
-        
+
         except asyncio.CancelledError:
             async with self._lock:
                 self._release_batch(batch)
