@@ -18,16 +18,18 @@ from __future__ import annotations
 
 import hashlib
 import io
-from typing import Any, Protocol
+from typing import Any, NoReturn, Protocol
 from urllib.parse import quote
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict
 
 from powercontext.limits import MAX_SOURCE_ID_LENGTH
-from powercontext.sources.adapters import SourceAdapter
-from powercontext.sources.definitions import AdapterSourceDefinition, SourceProjection
+from powercontext.sources.definitions import AdapterSourceDefinition
 from powercontext.sources.models import Source, SourceMaterialization
 from powercontext.sources.projections import TextEvidence
+
+#: Room left for the revision prefix and the page number inside one page identity.
+_DOCUMENT_ID_BUDGET = MAX_SOURCE_ID_LENGTH - 64
 
 
 class PDFDocumentInput(BaseModel):
@@ -70,81 +72,84 @@ class PDFPageSource(Source):
         return self.source_id
 
 
+class _PDFInputError(ValueError):
+    """An input from which a complete page set cannot be produced."""
+
+
+def _reject(message: str) -> NoReturn:
+    raise _PDFInputError(message)
+
+
 def pdf_page_source_id(document_id: str, document_sha256: str, page_number: int) -> str:
-    """Compute the stable source identity for a PDF page.
+    """Build the identity of one page of one document revision.
 
-    Format: pdf:<url-encoded-doc-id>:<sha256-prefix>:<page-number>
+    The identity is `(document id, document revision, physical page)`, percent-encoded so no
+    component can impersonate a separator. A document id longer than the budget travels as its
+    own digest, which keeps the identity stable and inside the platform limit for any input.
     """
-    encoded_doc = quote(document_id, safe="")
-    sha_prefix = document_sha256[:16]
-    identity = f"pdf:{encoded_doc}:{sha_prefix}:{page_number}"
 
+    encoded = quote(document_id, safe="")
+    if len(encoded) > _DOCUMENT_ID_BUDGET:
+        encoded = hashlib.sha256(document_id.encode("utf-8")).hexdigest()
+    identity = f"pdf:{encoded}:{document_sha256[:16]}:{page_number}"
     if len(identity) > MAX_SOURCE_ID_LENGTH:
-        raise ValueError(f"source_id must not exceed {MAX_SOURCE_ID_LENGTH} characters")
-
+        _reject("page identity must stay within the source id limit")
     return identity
 
 
-def parse_pdf_document(input: PDFDocumentInput, /) -> tuple[PDFPageInput, ...]:
-    """Parse a PDF document and return all physical pages.
+def _read_pages(content: bytes) -> list[tuple[int, str]]:
+    """Return ``(physical page number, extracted text)`` for every page of the document."""
 
-    - Pages are numbered from 1
-    - Blank pages are included with empty text
-    - Document SHA-256 is computed from the full input bytes
-    - Invalid/corrupt PDFs raise ValueError atomically
-    """
     from pypdf import PdfReader
-    from pypdf.errors import PdfReadError
-
-    document_id = input.document_id
-    content = input.content
-
-    if not document_id or not document_id.strip():
-        raise ValueError("document_id must be a non-empty string")
-
-    if not content:
-        raise ValueError("empty PDF content")
-
-    if not content.startswith(b"%PDF"):
-        raise ValueError("not a valid PDF file")
-
-    document_sha256 = hashlib.sha256(content).hexdigest()
 
     try:
         reader = PdfReader(io.BytesIO(content))
-
-        if reader.is_encrypted:
-            try:
-                reader.decrypt("")
-            except Exception:
-                pass
-
-        pages: list[PDFPageInput] = []
-        for page_num, page in enumerate(reader.pages, start=1):
-            try:
-                text = page.extract_text() or ""
-            except Exception:
-                text = ""
-
-            pages.append(
-                PDFPageInput(
-                    document_id=document_id,
-                    document_sha256=document_sha256,
-                    page_number=page_num,
-                    text=text,
-                )
-            )
-
-        return tuple(pages)
-
-    except PdfReadError as error:
-        raise ValueError(f"invalid PDF: {error}") from error
+        if reader.is_encrypted and not reader.decrypt(""):
+            _reject("PDF needs a user password before its pages can be read")
+        return [(number, page.extract_text() or "") for number, page in enumerate(reader.pages, start=1)]
+    except _PDFInputError:
+        raise
     except Exception as error:
-        raise ValueError(f"PDF parsing error: {error}") from error
+        message = f"PDF could not be parsed completely: {error}"
+        raise _PDFInputError(message) from error
+
+
+def parse_pdf_document(value: PDFDocumentInput) -> tuple[PDFPageInput, ...]:
+    """Parse a complete PDF into every physical page, in document order.
+
+    Page numbers start at one and blank pages stay in the sequence with empty text. A document
+    whose pages cannot all be read fails as a whole, so a caller never receives a partial page
+    list.
+    """
+
+    document_id = value.document_id
+    content = value.content
+
+    if not document_id.strip():
+        _reject("document_id must not be empty or whitespace")
+    if not content:
+        _reject("PDF content must not be empty")
+    if not content.startswith(b"%PDF"):
+        _reject("content is not a PDF file")
+
+    pages = _read_pages(content)
+    if not pages:
+        _reject("PDF has no pages")
+
+    document_sha256 = hashlib.sha256(content).hexdigest()
+    return tuple(
+        PDFPageInput(
+            document_id=document_id,
+            document_sha256=document_sha256,
+            page_number=page_number,
+            text=text,
+        )
+        for page_number, text in pages
+    )
 
 
 class PDFPageTextEvidenceProjection:
-    """Project PDFPageSource to TextEvidence for memory retrieval."""
+    """Project a PDF page Source onto the standard text-evidence view."""
 
     name = "powercontext.text-evidence"
     version = "1"
@@ -152,11 +157,10 @@ class PDFPageTextEvidenceProjection:
     output_class = TextEvidence
 
     def project(self, source: PDFPageSource, /) -> TextEvidence:
-        content = f"{source.document_id}\n{source.text}"
         return TextEvidence(
             source_type="pdf-page",
             source_id=source.source_id,
-            content=content,
+            content=f"{source.document_id}\n{source.text}",
             metadata={
                 "document_id": source.document_id,
                 "document_sha256": source.document_sha256,
@@ -166,7 +170,7 @@ class PDFPageTextEvidenceProjection:
 
 
 class _PDFPageAdapter:
-    """Internal adapter for PDFPageInput -> PDFPageSource."""
+    """Turn one PDF page input into its captured Source, and back again."""
 
     input_class = PDFPageInput
     name = "pdf-page"
@@ -199,52 +203,45 @@ PDF_PAGE_SOURCE_DEFINITION = AdapterSourceDefinition(
 )
 
 
-class _MemoryProtocol(Protocol):
-    """Protocol for the scoped Memory interface."""
+class _ScopedMemory(Protocol):
+    """The public scoped Memory surface the page search is allowed to use."""
 
     async def search(self, request: Any, /) -> Any: ...
 
 
 async def search_pdf_pages(
-    memory: _MemoryProtocol,
+    memory: _ScopedMemory,
     question: str,
     limit: int = 10,
 ) -> tuple[Any, ...]:
-    """Search PDF pages using the scoped Memory API.
+    """Return exact citations for up to ``limit`` pages that answer a natural-language question.
 
-    Returns up to `limit` distinct MemoryCitation objects for pages
-    matching the natural language question.
+    Retrieval goes through the public Memory search of the caller's scope, so every citation
+    points at stored evidence; the offline text index is the only ranking signal available
+    without a model.
     """
+
+    from powercontext.builtin.artifacts.memory.models import MemoryCitation
     from powercontext.builtin.runtime.models import SearchMemoryRequest
 
-    request = SearchMemoryRequest(
-        query=question,
-        mode="fts",
-        limit=limit,
-    )
+    page = await memory.search(SearchMemoryRequest(query=question, mode="fts", limit=limit))
 
-    result = await memory.search(request)
-
-    citations = []
-    seen = set()
-
-    for hit in result.hits:
-        from powercontext.builtin.artifacts.memory.models import MemoryCitation
-
-        citation = MemoryCitation(
-            memory_ref=hit.memory_ref,
-            entry_id=hit.entry_id,
-            entry_version_id=hit.entry_version_id,
-        )
-
-        citation_key = (hit.memory_ref.artifact_id, hit.entry_id, hit.entry_version_id)
-        if citation_key not in seen:
-            seen.add(citation_key)
-            citations.append(citation)
-
+    citations: list[Any] = []
+    seen: set[tuple[str, str, str]] = set()
+    for hit in page.hits:
         if len(citations) >= limit:
             break
-
+        key = (hit.memory_ref.artifact_id, hit.entry_id, hit.entry_version_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        citations.append(
+            MemoryCitation(
+                memory_ref=hit.memory_ref,
+                entry_id=hit.entry_id,
+                entry_version_id=hit.entry_version_id,
+            )
+        )
     return tuple(citations)
 
 
