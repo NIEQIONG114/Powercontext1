@@ -53,9 +53,11 @@ async def search_pdf_pages(
 
 `content` 是完整原 PDF，不能用预解析文本替代，也不能只解析证据页。以物理页为分块边界，按顺序返回所有页，页码从 1 开始，包括空白页。`text` 保存本页可提取的正文，保留文字、表格数字与所属页关系。页面布局空白可以不同，不要求复刻 PDF 视觉排版。本题不涉及扫描件 OCR。共享环境提供锁定的 pypdf。
 
-文档 ID 不得为空或纯空白。摘要为整个输入 PDF 的 SHA-256 小写十六进制字符串。带有空密码权限标记、无需用户提供密码即可读取的 PDF 属于合法输入。空文件、非 PDF、损坏或无法完整解析的文件以 `ValueError` 失败，不返回部分页。
+空白页指本页确实没有可提取文本，此时 `text` 为空字符串；文本提取过程本身报错不属于空白页，而属于无法完整解析。空文件、非 PDF、损坏、读不出任何页（含零页文档）或需要用户提供密码才能读取的文件以 `ValueError` 失败，不返回部分页。带有空密码权限标记、无需用户提供密码即可读取的 PDF 属于合法输入。
 
-Definition 的名称为 `pdf-page`、版本为 `1`，输入类型为 `PDFPageInput`。每页解析为 `CAPTURED` Source，`read` 返回该页输入。Source 身份由 `(document_id, document_sha256, page_number)` 决定，稳定、无碰撞且不超过 256 字符。PDF 修订后产生新身份，旧引用继续指向原修订。
+文档 ID 不得为空或纯空白。摘要为整个输入 PDF 的 SHA-256 小写十六进制字符串。
+
+Definition 的名称为 `pdf-page`、版本为 `1`，输入类型为 `PDFPageInput`。每页解析为 `CAPTURED` Source，`read` 返回该页输入。Source 身份由 `(document_id, document_sha256, page_number)` 决定，稳定、无碰撞且在任何文档 ID 长度下都不超过 256 字符；文档 ID 过长时实现可以改用其摘要承载身份，只要同一三元组始终得到同一身份、不同三元组不共享身份。PDF 修订后产生新身份，旧引用继续指向原修订。
 
 标准文本投影的 `source_type="pdf-page"`，`source_id` 为 Source `name`，`content` 为 `DOCUMENT_ID\nPAGE_TEXT`。metadata 恰好包含 `document_id`、`document_sha256` 和 `page_number`。调用方用文档摘要找到原 PDF，再用物理页码定位，不能混用财报印刷页码。
 
@@ -63,7 +65,7 @@ Definition 的名称为 `pdf-page`、版本为 `1`，输入类型为 `PDFPageInp
 
 判题将所有页面 observation 提交至真实 Runtime，并使用固定 pipeline 将其文本放入 Memory。重复提交不增加 Source。关闭并重新打开 Runtime 后，从同一数据划分的文档集合检索；不同文档集合分别建立数据库。
 
-`search_pdf_pages` 接收已打开的 scoped Memory、FinanceBench 原始自然语言问题以及返回上限。通过公开 Memory API 搜索并返回最多 `limit` 个不同页面的精确 `MemoryCitation`。允许离线查询处理及重排；不能绕过 Memory 存储创建虚假引用。判题逐条 `memory.get` 回查文本及 Source，核对完整文档摘要和物理页码。
+`search_pdf_pages` 接收已打开的 scoped Memory、FinanceBench 原始自然语言问题以及返回上限，三者均可按关键字传入。只允许通过公开 Memory API 搜索，返回最多 `limit` 个指向不同页面的精确 `MemoryCitation`；每个 citation 必须能由 `memory.get` 回查到该页文本及其 Source。允许离线查询处理及重排；不能绕过 Memory 存储创建虚假引用，也不能直接读取数据库、原 PDF 或任何判题资产。判题逐条 `memory.get` 回查文本及 Source，核对完整文档摘要和物理页码。
 
 ### 2.5 解析质量
 
@@ -91,7 +93,7 @@ Definition 的名称为 `pdf-page`、版本为 `1`，输入类型为 `PDFPageInp
 
 | 必测行为 | 通过条件 |
 | --- | --- |
-| 完整解析与身份 | 所有物理页按序返回；空白页、合法权限、原子失败、摘要及修订身份符合合同 |
+| 完整解析与身份 | 所有物理页按序返回；空白页、合法权限、原子失败（含零页与提取报错）、摘要及修订身份符合契约，身份长度对任意文档 ID 都有界 |
 | 持久化与引用 | 全部页面真实入库，重复提交幂等；重启后的返回上限、不同页和精确 citation 正确 |
 | 覆盖及质量 | 完整评测各组分别满足每页词项数 90% 至 110%、标注证据召回 0.95、标注整页 F1 0.95 及 evidence-page Recall@20 0.70 |
 
@@ -109,8 +111,9 @@ make -C competition test-pdf
 
 提交前检查：
 
-- 检查全部物理页、空白页顺序、合法空密码权限和解析失败的原子性。
+- 检查全部物理页、空白页顺序、合法空密码权限和解析失败的原子性；空文件、非 PDF、零页、需用户口令和正文提取报错都整篇失败。
 - 核对完整字节摘要、页级修订身份、重启后的持久化及精确引用。
+- 用超长文档 ID 检查身份仍不超过 256 字符，且同一三元组重复解析得到同一身份。
 - 检查 limit 和不同页要求，回查正文、文档摘要及物理页码。
 - 用公开样例检查全页覆盖和引用，并确认实现满足题面公布的解析与检索质量要求。
 - 核对仓库 URL、完整 commit 及公开接口。公开自测通过后仍须满足全部必测行为。
