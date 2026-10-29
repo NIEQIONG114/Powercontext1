@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 import math
-from typing import Any
+from typing import Any, NoReturn
 
 import httpx
 
@@ -29,13 +29,21 @@ from powercontext.builtin.artifacts.memory.reranking import (
 from powercontext.builtin.inference import InferenceUsage
 
 
-class HTTPMemoryReranker:
-    """Rerank Memory candidates via an HTTP scoring service with batched requests.
+class _ContractViolation(ValueError):
+    """A caller or a service value outside the Memory reranking contract."""
 
-    Splits candidates into batches of at most batch_size, sends each batch to the
-    endpoint for scoring, validates responses, then globally sorts all candidates
-    by score descending (ties broken by original rank ascending) and returns the
-    top limit ranks.
+
+def _reject(message: str) -> NoReturn:
+    raise _ContractViolation(message)
+
+
+class HTTPMemoryReranker:
+    """Rerank Memory candidates through a batched HTTP scoring service.
+
+    Candidates travel in batches of at most ``batch_size``, and every batch keeps the
+    caller's one-based global ranks. Because the ranks are global, the per-batch scores
+    merge back into a single ordering over the whole pool: score descending, ties broken
+    by the original rank ascending.
     """
 
     def __init__(
@@ -47,7 +55,7 @@ class HTTPMemoryReranker:
         policy_id: str = "http-cross-encoder-v1",
     ) -> None:
         if batch_size < 1:
-            raise ValueError("batch_size must be at least 1")
+            _reject("batch_size must be at least 1")
         self._endpoint = endpoint
         self._client = client
         self._batch_size = batch_size
@@ -60,96 +68,83 @@ class HTTPMemoryReranker:
         limit: int,
         /,
     ) -> MemoryRerankDecision:
-        """Score candidates via HTTP batches and return the globally top-ranked selection."""
+        """Score every candidate exactly once, then select the globally best ``limit`` ranks."""
 
         _validate_bounds(len(candidates), limit)
 
-        all_scores: list[tuple[int, float]] = []
+        scored: list[tuple[int, float]] = []
         requests_made = 0
-
-        for batch_start in range(0, len(candidates), self._batch_size):
-            batch_end = min(batch_start + self._batch_size, len(candidates))
-            batch_candidates = candidates[batch_start:batch_end]
-            batch_ranks = list(range(batch_start + 1, batch_end + 1))
-
-            request_body = {
-                "query": query,
-                "candidates": [
-                    {"rank": rank, "text": candidates[rank - 1].text}
-                    for rank in batch_ranks
-                ],
-            }
-
-            response = await self._client.post(self._endpoint, json=request_body)
+        for start in range(0, len(candidates), self._batch_size):
+            ranks = range(start + 1, min(start + self._batch_size, len(candidates)) + 1)
+            scored.extend(await self._score_batch(query, candidates, ranks))
             requests_made += 1
 
-            response_data = _parse_response(response)
-            _validate_scores(response_data, batch_ranks)
-
-            for score_entry in response_data["scores"]:
-                all_scores.append((score_entry["rank"], score_entry["score"]))
-
-        all_scores.sort(key=lambda x: (-x[1], x[0]))
-        selected_ranks = tuple(rank for rank, _ in all_scores[:limit])
-
+        scored.sort(key=lambda item: (-item[1], item[0]))
         return MemoryRerankDecision(
-            selected_ranks=selected_ranks,
+            selected_ranks=tuple(rank for rank, _ in scored[:limit]),
             usage=InferenceUsage(requests=requests_made),
         )
 
+    async def _score_batch(
+        self,
+        query: str,
+        candidates: tuple[MemoryHit, ...],
+        ranks: range,
+    ) -> list[tuple[int, float]]:
+        """Send one batch and return its ``(global rank, score)`` pairs."""
 
-def _parse_response(response: httpx.Response) -> dict[str, Any]:
-    """Parse and validate the top-level response schema."""
+        request_body = {
+            "query": query,
+            "candidates": [{"rank": rank, "text": candidates[rank - 1].text} for rank in ranks],
+        }
+        response = await self._client.post(self._endpoint, json=request_body)
+        # A rejected status must surface as the httpx status error even when the body
+        # happens to parse: an error page is never a set of candidate scores.
+        response.raise_for_status()
+        return _read_scores(response, expected_ranks=set(ranks))
+
+
+def _read_scores(response: httpx.Response, *, expected_ranks: set[int]) -> list[tuple[int, float]]:
+    """Parse one batch response and enforce exact coverage of that batch's ranks."""
 
     try:
-        data = response.json()
-    except (ValueError, TypeError) as exc:
-        raise ValueError(f"invalid JSON response: {exc}") from exc
+        payload = response.json()
+    except (ValueError, TypeError) as error:
+        message = f"reranker response is not JSON: {error}"
+        raise _ContractViolation(message) from error
 
-    if not isinstance(data, dict) or set(data.keys()) != {"scores"}:
-        raise ValueError("response must have exactly one key: 'scores'")
+    if not isinstance(payload, dict) or set(payload) != {"scores"}:
+        _reject("reranker response must be an object with exactly one key: 'scores'")
+    entries = payload["scores"]
+    if not isinstance(entries, list):
+        _reject("reranker response 'scores' must be a list")
 
-    if not isinstance(data["scores"], list):
-        raise ValueError("'scores' must be a list")
+    observed: dict[int, float] = {}
+    for entry in entries:
+        rank, score = _read_score_entry(entry)
+        if rank in observed:
+            _reject(f"reranker response repeats rank {rank}")
+        observed[rank] = score
 
-    return data
+    if set(observed) != expected_ranks:
+        _reject(f"reranker response covered ranks {sorted(observed)} instead of {sorted(expected_ranks)}")
+    return list(observed.items())
 
 
-def _validate_scores(response_data: dict[str, Any], expected_ranks: list[int]) -> None:
-    """Validate each score entry and ensure exact rank coverage for the batch."""
+def _read_score_entry(entry: Any) -> tuple[int, float]:
+    """Validate one ``{"rank", "score"}`` record."""
 
-    scores = response_data["scores"]
-    seen_ranks: set[int] = set()
-
-    for entry in scores:
-        if not isinstance(entry, dict) or set(entry.keys()) != {"rank", "score"}:
-            raise ValueError("each score entry must have exactly keys: 'rank' and 'score'")
-
-        rank = entry["rank"]
-        score = entry["score"]
-
-        if not isinstance(rank, int) or isinstance(rank, bool):
-            raise ValueError(f"rank must be an integer, got {type(rank).__name__}")
-
-        if not isinstance(score, (int, float)) or isinstance(score, bool):
-            raise ValueError(f"score must be a number, got {type(score).__name__}")
-
-        if not math.isfinite(score):
-            raise ValueError(f"score must be finite, got {score}")
-
-        if rank in seen_ranks:
-            raise ValueError(f"duplicate rank {rank} in response")
-        seen_ranks.add(rank)
-
-    if seen_ranks != set(expected_ranks):
-        missing = set(expected_ranks) - seen_ranks
-        extra = seen_ranks - set(expected_ranks)
-        parts = []
-        if missing:
-            parts.append(f"missing ranks: {sorted(missing)}")
-        if extra:
-            parts.append(f"extra ranks: {sorted(extra)}")
-        raise ValueError(f"rank coverage mismatch: {', '.join(parts)}")
+    if not isinstance(entry, dict) or set(entry) != {"rank", "score"}:
+        _reject("each reranker score must be an object with exactly 'rank' and 'score'")
+    rank = entry["rank"]
+    score = entry["score"]
+    if isinstance(rank, bool) or not isinstance(rank, int):
+        _reject(f"reranker score rank must be an integer, got {type(rank).__name__}")
+    if isinstance(score, bool) or not isinstance(score, (int, float)):
+        _reject(f"reranker score value must be a number, got {type(score).__name__}")
+    if not math.isfinite(score):
+        _reject(f"reranker score value must be finite, got {score!r}")
+    return rank, float(score)
 
 
 __all__ = ["HTTPMemoryReranker"]
